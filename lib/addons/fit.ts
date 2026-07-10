@@ -44,6 +44,7 @@ export class FitAddon implements ITerminalAddon {
   private _lastCols?: number;
   private _lastRows?: number;
   private _isResizing: boolean = false;
+  private _fitPending: boolean = false;
 
   /**
    * Activate the addon (called by Terminal.loadAddon)
@@ -71,6 +72,7 @@ export class FitAddon implements ITerminalAddon {
     // Clear stored dimensions
     this._lastCols = undefined;
     this._lastRows = undefined;
+    this._fitPending = false;
 
     this._terminal = undefined;
   }
@@ -82,48 +84,42 @@ export class FitAddon implements ITerminalAddon {
    * Does nothing if dimensions cannot be calculated or haven't changed.
    */
   public fit(): void {
-    // Prevent re-entrant calls during resize
+    // Terminal.resize() can synchronously trigger another fit through resize
+    // listeners. Preserve that request and apply the latest container size once
+    // the current resize completes.
     if (this._isResizing) {
+      this._fitPending = true;
       return;
     }
 
-    const dims = this.proposeDimensions();
-    if (!dims || !this._terminal) {
-      return;
-    }
+    do {
+      this._fitPending = false;
 
-    // Access terminal to check current dimensions
-    const terminal = this._terminal as any;
-    const currentCols = terminal.cols;
-    const currentRows = terminal.rows;
-
-    // Check if dimensions actually changed (prevent feedback loops)
-    // Compare against BOTH proposed dimensions AND current terminal dimensions
-    if (
-      (dims.cols === this._lastCols && dims.rows === this._lastRows) ||
-      (dims.cols === currentCols && dims.rows === currentRows)
-    ) {
-      return;
-    }
-
-    // Store dimensions before resize
-    this._lastCols = dims.cols;
-    this._lastRows = dims.rows;
-
-    // Set flag to prevent re-entrant calls
-    this._isResizing = true;
-
-    try {
-      // Resize terminal
-      if (terminal.resize && typeof terminal.resize === 'function') {
-        terminal.resize(dims.cols, dims.rows);
+      const dims = this.proposeDimensions();
+      if (!dims || !this._terminal) {
+        return;
       }
-    } finally {
-      // Clear flag after a short delay to allow DOM to settle
-      setTimeout(() => {
+
+      const terminal = this._terminal as any;
+      const currentCols = terminal.cols;
+      const currentRows = terminal.rows;
+
+      this._lastCols = dims.cols;
+      this._lastRows = dims.rows;
+
+      if (dims.cols === currentCols && dims.rows === currentRows) {
+        continue;
+      }
+
+      this._isResizing = true;
+      try {
+        if (terminal.resize && typeof terminal.resize === 'function') {
+          terminal.resize(dims.cols, dims.rows);
+        }
+      } finally {
         this._isResizing = false;
-      }, 50);
-    }
+      }
+    } while (this._fitPending);
   }
 
   /**
@@ -216,11 +212,6 @@ export class FitAddon implements ITerminalAddon {
 
     // Create ResizeObserver that watches for external size changes
     this._resizeObserver = new ResizeObserver((entries) => {
-      // Ignore resize events while we're actively resizing
-      if (this._isResizing) {
-        return;
-      }
-
       // Only trigger if the observed element's content rect changed
       const entry = entries[0];
       if (!entry) return;

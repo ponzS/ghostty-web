@@ -211,6 +211,88 @@ describe('Dimension Calculation', () => {
     expect(resizedRows).toBe(30);
   });
 
+  test('fit() applies the latest dimensions during rapid resize', () => {
+    const mockElement = document.createElement('div');
+    let width = 900;
+    let height = 480;
+    Object.defineProperty(mockElement, 'clientWidth', {
+      get: () => width,
+      configurable: true,
+    });
+    Object.defineProperty(mockElement, 'clientHeight', {
+      get: () => height,
+      configurable: true,
+    });
+
+    const resizeCalls: Array<{ cols: number; rows: number }> = [];
+    const mockTerminal = {
+      cols: 80,
+      rows: 24,
+      element: mockElement,
+      renderer: {
+        getMetrics: () => ({ width: 9, height: 16, baseline: 12 }),
+      },
+      resize: (cols: number, rows: number) => {
+        mockTerminal.cols = cols;
+        mockTerminal.rows = rows;
+        resizeCalls.push({ cols, rows });
+      },
+    };
+
+    addon.activate(mockTerminal as any);
+    addon.fit();
+
+    width = 540;
+    height = 320;
+    addon.fit();
+
+    expect(resizeCalls).toEqual([
+      { cols: 98, rows: 30 },
+      { cols: 58, rows: 20 },
+    ]);
+    expect({ cols: mockTerminal.cols, rows: mockTerminal.rows }).toEqual({
+      cols: 58,
+      rows: 20,
+    });
+  });
+
+  test('fit() preserves a resize requested synchronously by a resize listener', () => {
+    const mockElement = document.createElement('div');
+    let width = 900;
+    Object.defineProperty(mockElement, 'clientWidth', {
+      get: () => width,
+      configurable: true,
+    });
+    Object.defineProperty(mockElement, 'clientHeight', { value: 480, configurable: true });
+
+    const resizeCalls: Array<{ cols: number; rows: number }> = [];
+    const mockTerminal = {
+      cols: 80,
+      rows: 24,
+      element: mockElement,
+      renderer: {
+        getMetrics: () => ({ width: 9, height: 16, baseline: 12 }),
+      },
+      resize: (cols: number, rows: number) => {
+        mockTerminal.cols = cols;
+        mockTerminal.rows = rows;
+        resizeCalls.push({ cols, rows });
+        if (resizeCalls.length === 1) {
+          width = 540;
+          addon.fit();
+        }
+      },
+    };
+
+    addon.activate(mockTerminal as any);
+    addon.fit();
+
+    expect(resizeCalls).toEqual([
+      { cols: 98, rows: 30 },
+      { cols: 58, rows: 30 },
+    ]);
+  });
+
   test('proposeDimensions returns correct values', () => {
     // FitAddon subtracts 15px for scrollbar width
     const mockElement = document.createElement('div');
