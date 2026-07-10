@@ -104,7 +104,6 @@ export class Terminal implements ITerminalCore {
   private animationFrameId?: number;
   private writeQueue: Uint8Array[] = [];
   private awaitingEcho = false;
-  private pendingRenderFrame?: number;
 
   // Addons
   private addons: ITerminalAddon[] = [];
@@ -223,7 +222,6 @@ export class Terminal implements ITerminalCore {
           this.currentTheme = this.resolveThemeUpdate(newValue);
           this.renderer.setTheme(this.currentTheme);
           this.wasmTerm.setColors(this.buildThemeColorsConfig(this.currentTheme));
-          this.performRender(true);
         }
         break;
 
@@ -574,7 +572,7 @@ export class Terminal implements ITerminalCore {
       parent.addEventListener('wheel', this.handleWheel, { passive: false, capture: true });
 
       // Render initial blank screen (force full redraw)
-      this.performRender(true);
+      this.renderer.render(this.wasmTerm, true, this.viewportY, this, this.scrollbarOpacity);
 
       // Start render loop
       this.startRenderLoop();
@@ -611,6 +609,13 @@ export class Terminal implements ITerminalCore {
     // preserve selection when new data arrives. Selection is cleared by user actions
     // like clicking or typing, not by incoming data.
 
+    const previousScrollbackLength = this.getScrollbackLength();
+    const previousViewportY = this.viewportY;
+    const previousTargetViewportY = this.scrollAnimationFrame
+      ? this.targetViewportY
+      : previousViewportY;
+    const wasAtBottom = previousViewportY <= 0.01 && previousTargetViewportY <= 0.01;
+
     // Write directly to WASM terminal (handles VT parsing internally)
     this.wasmTerm!.write(data);
 
@@ -629,9 +634,28 @@ export class Terminal implements ITerminalCore {
     // Invalidate link cache (content changed)
     this.linkDetector?.invalidateCache();
 
-    // Phase 2: Auto-scroll to bottom on new output (xterm.js behavior)
-    if (this.viewportY !== 0) {
+    if (wasAtBottom) {
       this.scrollToBottom();
+    } else {
+      const scrollbackLength = this.getScrollbackLength();
+      const addedScrollback = Math.max(0, scrollbackLength - previousScrollbackLength);
+      const nextViewportY = Math.max(
+        0,
+        Math.min(scrollbackLength, previousViewportY + addedScrollback)
+      );
+      const nextTargetViewportY = Math.max(
+        0,
+        Math.min(scrollbackLength, previousTargetViewportY + addedScrollback)
+      );
+
+      if (nextViewportY !== this.viewportY || nextTargetViewportY !== this.targetViewportY) {
+        this.viewportY = nextViewportY;
+        this.targetViewportY = nextTargetViewportY;
+        this.scrollEmitter.fire(Math.floor(this.viewportY));
+      }
+      if (scrollbackLength > 0) {
+        this.showScrollbar();
+      }
     }
 
     // Check for title changes (OSC 0, 1, 2 sequences)
@@ -649,7 +673,7 @@ export class Terminal implements ITerminalCore {
     if (this.awaitingEcho) {
       this.awaitingEcho = false;
       if (this.renderer && this.wasmTerm) {
-        this.performRender(false);
+        this.renderer.render(this.wasmTerm, false, this.viewportY, this, this.scrollbarOpacity);
       }
     }
 
@@ -693,36 +717,6 @@ export class Terminal implements ITerminalCore {
       // Send data directly
       this.dataEmitter.fire(data);
     }
-  }
-
-  /**
-   * Request an explicit render pass.
-   *
-   * The normal render loop only paints rows marked dirty by the WASM render
-   * state. Embedders can use this to force a repaint after external canvas
-   * visibility/style changes.
-   */
-  requestRender(options: { full?: boolean } = {}): void {
-    this.assertOpen();
-    if (!this.renderer || !this.wasmTerm) return;
-
-    const forceAll = options.full === true;
-    if (forceAll) {
-      if (this.pendingRenderFrame !== undefined) {
-        cancelAnimationFrame(this.pendingRenderFrame);
-        this.pendingRenderFrame = undefined;
-      }
-      this.performRender(true);
-      return;
-    }
-
-    if (this.pendingRenderFrame !== undefined) return;
-    this.pendingRenderFrame = requestAnimationFrame(() => {
-      this.pendingRenderFrame = undefined;
-      if (!this.isDisposed && this.isOpen && this.renderer && this.wasmTerm) {
-        this.performRender(false);
-      }
-    });
   }
 
   /**
@@ -787,7 +781,7 @@ export class Terminal implements ITerminalCore {
       this.resizeEmitter.fire({ cols, rows });
 
       // Force full render
-      this.performRender(true);
+      this.renderer!.render(this.wasmTerm!, true, this.viewportY, this);
     } catch (e) {
       console.error('Terminal resize failed:', e);
     }
@@ -1007,8 +1001,9 @@ export class Terminal implements ITerminalCore {
     // So we SUBTRACT amount (negative amount becomes positive change)
     const newViewportY = Math.max(0, Math.min(maxScroll, this.viewportY - amount));
 
-    if (newViewportY !== this.viewportY) {
+    if (newViewportY !== this.viewportY || newViewportY !== this.targetViewportY) {
       this.viewportY = newViewportY;
+      this.targetViewportY = newViewportY;
       this.scrollEmitter.fire(this.viewportY);
 
       // Show scrollbar when scrolling (with auto-hide)
@@ -1031,8 +1026,12 @@ export class Terminal implements ITerminalCore {
    */
   public scrollToTop(): void {
     const scrollbackLength = this.getScrollbackLength();
-    if (scrollbackLength > 0 && this.viewportY !== scrollbackLength) {
+    if (
+      scrollbackLength > 0 &&
+      (this.viewportY !== scrollbackLength || this.targetViewportY !== scrollbackLength)
+    ) {
       this.viewportY = scrollbackLength;
+      this.targetViewportY = scrollbackLength;
       this.scrollEmitter.fire(this.viewportY);
       this.showScrollbar();
     }
@@ -1042,8 +1041,9 @@ export class Terminal implements ITerminalCore {
    * Scroll viewport to the bottom (current output)
    */
   public scrollToBottom(): void {
-    if (this.viewportY !== 0) {
+    if (this.viewportY !== 0 || this.targetViewportY !== 0) {
       this.viewportY = 0;
+      this.targetViewportY = 0;
       this.scrollEmitter.fire(this.viewportY);
       // Show scrollbar briefly when scrolling to bottom
       if (this.getScrollbackLength() > 0) {
@@ -1060,8 +1060,9 @@ export class Terminal implements ITerminalCore {
     const scrollbackLength = this.getScrollbackLength();
     const newViewportY = Math.max(0, Math.min(scrollbackLength, line));
 
-    if (newViewportY !== this.viewportY) {
+    if (newViewportY !== this.viewportY || newViewportY !== this.targetViewportY) {
       this.viewportY = newViewportY;
+      this.targetViewportY = newViewportY;
       this.scrollEmitter.fire(this.viewportY);
 
       // Show scrollbar when scrolling to specific line
@@ -1183,10 +1184,6 @@ export class Terminal implements ITerminalCore {
 
     // Stop render loop and clear write queue
     this.cancelRenderLoop();
-    if (this.pendingRenderFrame !== undefined) {
-      cancelAnimationFrame(this.pendingRenderFrame);
-      this.pendingRenderFrame = undefined;
-    }
     this.writeQueue.length = 0;
 
     // Stop smooth scroll animation
@@ -1248,25 +1245,6 @@ export class Terminal implements ITerminalCore {
   }
 
   /**
-   * Render once and fire compatibility events for explicit/full renders.
-   */
-  private performRender(forceAll: boolean = false, emitRender: boolean = true): void {
-    if (!this.renderer || !this.wasmTerm) return;
-
-    this.renderer.render(this.wasmTerm, forceAll, this.viewportY, this, this.scrollbarOpacity);
-
-    const cursor = this.wasmTerm.getCursor();
-    if (cursor.y !== this.lastCursorY) {
-      this.lastCursorY = cursor.y;
-      this.cursorMoveEmitter.fire();
-    }
-
-    if (emitRender) {
-      this.renderEmitter.fire({ start: 0, end: this.rows - 1 });
-    }
-  }
-
-  /**
    * Start the render loop
    */
   private startRenderLoop(): void {
@@ -1278,7 +1256,19 @@ export class Terminal implements ITerminalCore {
         // 1. Calls update() once to sync state and check dirty flags
         // 2. Only redraws dirty rows when forceAll=false
         // 3. Always calls clearDirty() at the end
-        this.performRender(false, false);
+        this.renderer!.render(this.wasmTerm!, false, this.viewportY, this, this.scrollbarOpacity);
+
+        // Check for cursor movement (Phase 2: onCursorMove event)
+        // Note: getCursor() reads from already-updated render state (from render() above)
+        const cursor = this.wasmTerm!.getCursor();
+        if (cursor.y !== this.lastCursorY) {
+          this.lastCursorY = cursor.y;
+          this.cursorMoveEmitter.fire();
+        }
+
+        // Note: onRender event is intentionally not fired in the render loop
+        // to avoid performance issues. For now, consumers can use requestAnimationFrame
+        // if they need frame-by-frame updates.
 
         this.animationFrameId = requestAnimationFrame(loop);
       }

@@ -3151,9 +3151,11 @@ describe('Dynamic Theme Changes', () => {
       theme: { background: '#000000', foreground: '#ffffff' },
     });
     term.open(container);
-    const { renderArgs, restore } = spyOnRendererRender(term);
 
     try {
+      term.wasmTerm!.markClean();
+      expect(term.wasmTerm!.needsFullRedraw()).toBe(false);
+
       term.options.theme = {
         background: '#112233',
         foreground: '#aabbcc',
@@ -3164,14 +3166,39 @@ describe('Dynamic Theme Changes', () => {
       expect(renderer.theme.background).toBe('#112233');
       expect(renderer.theme.foreground).toBe('#aabbcc');
       expect(renderer.theme.cursor).toBe('#445566');
-      expect(renderArgs).toHaveLength(1);
-      expect(renderArgs[0][1]).toBe(true);
+      expect(term.wasmTerm!.needsFullRedraw()).toBe(true);
 
       const colors = term.wasmTerm!.getColors();
       expect(colors.background).toEqual({ r: 0x11, g: 0x22, b: 0x33 });
       expect(colors.foreground).toEqual({ r: 0xaa, g: 0xbb, b: 0xcc });
     } finally {
-      restore();
+      term.dispose();
+    }
+  });
+
+  test('runtime theme change preserves scroll position', async () => {
+    if (!container) return;
+
+    const term = await createIsolatedTerminal({ cols: 40, rows: 5, scrollback: 100 });
+    term.open(container);
+
+    try {
+      for (let i = 0; i < 20; i++) {
+        term.write(`Line ${i}\r\n`);
+      }
+      term.scrollToLine(4);
+
+      const viewportY = term.viewportY;
+      const targetViewportY = (term as any).targetViewportY;
+
+      term.options.theme = {
+        background: '#112233',
+        foreground: '#ddeeff',
+      };
+
+      expect(term.viewportY).toBe(viewportY);
+      expect((term as any).targetViewportY).toBe(targetViewportY);
+    } finally {
       term.dispose();
     }
   });
@@ -3195,6 +3222,7 @@ describe('Dynamic Theme Changes', () => {
       expect(renderer.theme.foreground).toBe('#aabbcc');
       expect(renderer.theme.cursor).toBe('#212223');
 
+      expect(term.wasmTerm!.needsFullRedraw()).toBe(true);
       const colors = term.wasmTerm!.getColors();
       expect(colors.background).toEqual({ r: 0x01, g: 0x02, b: 0x03 });
       expect(colors.foreground).toEqual({ r: 0xaa, g: 0xbb, b: 0xcc });
@@ -3266,10 +3294,10 @@ describe('Dynamic Theme Changes', () => {
 });
 
 // ==========================================================================
-// Explicit Render Requests
+// Scrollback Viewport Stability
 // ==========================================================================
 
-describe('Explicit Render Requests', () => {
+describe('Scrollback Viewport Stability', () => {
   let container: HTMLElement | null = null;
 
   beforeEach(async () => {
@@ -3286,24 +3314,54 @@ describe('Explicit Render Requests', () => {
     }
   });
 
-  test('requestRender forces a full render and fires onRender', async () => {
+  test('new output keeps the same history content visible while scrolled up', async () => {
     if (!container) return;
 
-    const term = await createIsolatedTerminal({ cols: 80, rows: 24 });
+    const term = await createIsolatedTerminal({ cols: 40, rows: 5, scrollback: 100 });
     term.open(container);
-    const { renderArgs, restore } = spyOnRendererRender(term);
-    const events: Array<{ start: number; end: number }> = [];
-    const disposable = term.onRender((event) => events.push(event));
 
     try {
-      term.requestRender({ full: true });
+      for (let i = 0; i < 20; i++) {
+        term.write(`Line ${i}\r\n`);
+      }
+      term.scrollToLine(4);
 
-      expect(renderArgs).toHaveLength(1);
-      expect(renderArgs[0][1]).toBe(true);
-      expect(events).toEqual([{ start: 0, end: 23 }]);
+      const previousScrollbackLength = term.getScrollbackLength();
+      const previousViewportY = term.viewportY;
+      const previousTargetViewportY = (term as any).targetViewportY;
+
+      term.write('Next 1\r\nNext 2\r\n');
+
+      const addedScrollback = term.getScrollbackLength() - previousScrollbackLength;
+      expect(addedScrollback).toBeGreaterThan(0);
+      expect(term.viewportY).toBe(previousViewportY + addedScrollback);
+      expect((term as any).targetViewportY).toBe(previousTargetViewportY + addedScrollback);
+
+      const anchoredViewportY = term.viewportY;
+      term.scrollLines(-1);
+      expect(term.viewportY).toBe(anchoredViewportY + 1);
+      expect((term as any).targetViewportY).toBe(term.viewportY);
     } finally {
-      disposable.dispose();
-      restore();
+      term.dispose();
+    }
+  });
+
+  test('new output still follows the terminal when already at the bottom', async () => {
+    if (!container) return;
+
+    const term = await createIsolatedTerminal({ cols: 40, rows: 5, scrollback: 100 });
+    term.open(container);
+
+    try {
+      for (let i = 0; i < 20; i++) {
+        term.write(`Line ${i}\r\n`);
+      }
+
+      expect(term.viewportY).toBe(0);
+      term.write('Next\r\n');
+      expect(term.viewportY).toBe(0);
+      expect((term as any).targetViewportY).toBe(0);
+    } finally {
       term.dispose();
     }
   });
