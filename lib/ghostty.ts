@@ -582,6 +582,12 @@ export class GhosttyTerminal {
     return this.exports.ghostty_terminal_get_scrollback_length(this.handle);
   }
 
+  /** Get the wrapping generation for rows appended to normal-screen history. */
+  getScrollbackGeneration(): number | undefined {
+    const getGeneration = this.exports.ghostty_terminal_get_scrollback_generation;
+    return getGeneration ? getGeneration(this.handle) >>> 0 : undefined;
+  }
+
   /**
    * Get a line from the scrollback buffer.
    * Ensures render state is fresh by calling update().

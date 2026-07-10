@@ -610,6 +610,7 @@ export class Terminal implements ITerminalCore {
     // like clicking or typing, not by incoming data.
 
     const previousScrollbackLength = this.getScrollbackLength();
+    const previousScrollbackGeneration = this.wasmTerm!.getScrollbackGeneration();
     const previousViewportY = this.viewportY;
     const previousTargetViewportY = this.scrollAnimationFrame
       ? this.targetViewportY
@@ -638,7 +639,11 @@ export class Terminal implements ITerminalCore {
       this.scrollToBottom();
     } else {
       const scrollbackLength = this.getScrollbackLength();
-      const addedScrollback = Math.max(0, scrollbackLength - previousScrollbackLength);
+      const scrollbackGeneration = this.wasmTerm!.getScrollbackGeneration();
+      const addedScrollback =
+        previousScrollbackGeneration !== undefined && scrollbackGeneration !== undefined
+          ? (scrollbackGeneration - previousScrollbackGeneration) >>> 0
+          : Math.max(0, scrollbackLength - previousScrollbackLength);
       const nextViewportY = Math.max(
         0,
         Math.min(scrollbackLength, previousViewportY + addedScrollback)
