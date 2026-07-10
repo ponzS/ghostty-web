@@ -3122,6 +3122,194 @@ describe('Echo Latency Optimization', () => {
 });
 
 // ==========================================================================
+// Dynamic Theme Changes
+// ==========================================================================
+
+describe('Dynamic Theme Changes', () => {
+  let container: HTMLElement | null = null;
+
+  beforeEach(async () => {
+    if (typeof document !== 'undefined') {
+      container = document.createElement('div');
+      document.body.appendChild(container);
+    }
+  });
+
+  afterEach(() => {
+    if (container && container.parentNode) {
+      container.parentNode.removeChild(container);
+      container = null;
+    }
+  });
+
+  test('runtime theme change updates renderer and WASM default colors', async () => {
+    if (!container) return;
+
+    const term = await createIsolatedTerminal({
+      cols: 80,
+      rows: 24,
+      theme: { background: '#000000', foreground: '#ffffff' },
+    });
+    term.open(container);
+    const { renderArgs, restore } = spyOnRendererRender(term);
+
+    try {
+      term.options.theme = {
+        background: '#112233',
+        foreground: '#aabbcc',
+        cursor: '#445566',
+      };
+
+      const renderer = term.renderer as any;
+      expect(renderer.theme.background).toBe('#112233');
+      expect(renderer.theme.foreground).toBe('#aabbcc');
+      expect(renderer.theme.cursor).toBe('#445566');
+      expect(renderArgs).toHaveLength(1);
+      expect(renderArgs[0][1]).toBe(true);
+
+      const colors = term.wasmTerm!.getColors();
+      expect(colors.background).toEqual({ r: 0x11, g: 0x22, b: 0x33 });
+      expect(colors.foreground).toEqual({ r: 0xaa, g: 0xbb, b: 0xcc });
+    } finally {
+      restore();
+      term.dispose();
+    }
+  });
+
+  test('pre-open theme changes are preserved by later partial runtime updates', async () => {
+    if (!container) return;
+
+    const term = await createIsolatedTerminal({ cols: 80, rows: 24 });
+    term.options.theme = {
+      background: '#010203',
+      foreground: '#111213',
+      cursor: '#212223',
+    };
+    term.open(container);
+
+    try {
+      term.options.theme = { foreground: '#aabbcc' };
+
+      const renderer = term.renderer as any;
+      expect(renderer.theme.background).toBe('#010203');
+      expect(renderer.theme.foreground).toBe('#aabbcc');
+      expect(renderer.theme.cursor).toBe('#212223');
+
+      const colors = term.wasmTerm!.getColors();
+      expect(colors.background).toEqual({ r: 0x01, g: 0x02, b: 0x03 });
+      expect(colors.foreground).toEqual({ r: 0xaa, g: 0xbb, b: 0xcc });
+    } finally {
+      term.dispose();
+    }
+  });
+
+  test('default and ANSI palette cells re-resolve after runtime theme change', async () => {
+    if (!container) return;
+
+    const term = await createIsolatedTerminal({
+      cols: 80,
+      rows: 24,
+      theme: {
+        foreground: '#111111',
+        background: '#eeeeee',
+        red: '#331111',
+      },
+    });
+    term.open(container);
+
+    try {
+      term.write('A \x1b[31mR\x1b[0m');
+      term.options.theme = {
+        foreground: '#ffffff',
+        background: '#000000',
+        red: '#123456',
+      };
+
+      const line = term.wasmTerm!.getLine(0)!;
+      expect(line[0].fg_r).toBe(0xff);
+      expect(line[0].fg_g).toBe(0xff);
+      expect(line[0].fg_b).toBe(0xff);
+      expect(line[0].bg_r).toBe(0x00);
+      expect(line[0].bg_g).toBe(0x00);
+      expect(line[0].bg_b).toBe(0x00);
+
+      expect(line[2].fg_r).toBe(0x12);
+      expect(line[2].fg_g).toBe(0x34);
+      expect(line[2].fg_b).toBe(0x56);
+    } finally {
+      term.dispose();
+    }
+  });
+
+  test('explicit RGB cells are not rewritten by runtime theme change', async () => {
+    if (!container) return;
+
+    const term = await createIsolatedTerminal({ cols: 80, rows: 24 });
+    term.open(container);
+
+    try {
+      term.write('\x1b[38;2;100;200;50mRGB\x1b[0m');
+      term.options.theme = {
+        foreground: '#ffffff',
+        background: '#000000',
+        red: '#ff0000',
+      };
+
+      const line = term.wasmTerm!.getLine(0)!;
+      expect(line[0].fg_r).toBe(100);
+      expect(line[0].fg_g).toBe(200);
+      expect(line[0].fg_b).toBe(50);
+    } finally {
+      term.dispose();
+    }
+  });
+});
+
+// ==========================================================================
+// Explicit Render Requests
+// ==========================================================================
+
+describe('Explicit Render Requests', () => {
+  let container: HTMLElement | null = null;
+
+  beforeEach(async () => {
+    if (typeof document !== 'undefined') {
+      container = document.createElement('div');
+      document.body.appendChild(container);
+    }
+  });
+
+  afterEach(() => {
+    if (container && container.parentNode) {
+      container.parentNode.removeChild(container);
+      container = null;
+    }
+  });
+
+  test('requestRender forces a full render and fires onRender', async () => {
+    if (!container) return;
+
+    const term = await createIsolatedTerminal({ cols: 80, rows: 24 });
+    term.open(container);
+    const { renderArgs, restore } = spyOnRendererRender(term);
+    const events: Array<{ start: number; end: number }> = [];
+    const disposable = term.onRender((event) => events.push(event));
+
+    try {
+      term.requestRender({ full: true });
+
+      expect(renderArgs).toHaveLength(1);
+      expect(renderArgs[0][1]).toBe(true);
+      expect(events).toEqual([{ start: 0, end: 23 }]);
+    } finally {
+      disposable.dispose();
+      restore();
+      term.dispose();
+    }
+  });
+});
+
+// ==========================================================================
 // xterm.js Compatibility: Synchronous open()
 // ==========================================================================
 

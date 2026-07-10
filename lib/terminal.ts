@@ -29,12 +29,13 @@ import type {
   ITerminalAddon,
   ITerminalCore,
   ITerminalOptions,
+  ITheme,
   IUnicodeVersionProvider,
 } from './interfaces';
 import { LinkDetector } from './link-detector';
 import { OSC8LinkProvider } from './providers/osc8-link-provider';
 import { UrlRegexProvider } from './providers/url-regex-provider';
-import { CanvasRenderer } from './renderer';
+import { CanvasRenderer, DEFAULT_THEME } from './renderer';
 import { SelectionManager } from './selection-manager';
 import type { ILink, ILinkProvider } from './types';
 
@@ -103,6 +104,7 @@ export class Terminal implements ITerminalCore {
   private animationFrameId?: number;
   private writeQueue: Uint8Array[] = [];
   private awaitingEcho = false;
+  private pendingRenderFrame?: number;
 
   // Addons
   private addons: ITerminalAddon[] = [];
@@ -112,6 +114,9 @@ export class Terminal implements ITerminalCore {
 
   // Phase 1: Title tracking
   private currentTitle: string = '';
+
+  // Accumulated theme state. This lets runtime partial theme updates behave like xterm.js.
+  private currentTheme: Required<ITheme> = { ...DEFAULT_THEME };
 
   // Phase 2: Viewport and scrolling state
   public viewportY: number = 0; // Top line of viewport in scrollback buffer (0 = at bottom, can be fractional during smooth scroll)
@@ -160,6 +165,10 @@ export class Terminal implements ITerminalCore {
         const oldValue = target[prop];
         target[prop] = value;
 
+        if (prop === 'theme' && !this.isOpen) {
+          this.currentTheme = this.resolveThemeUpdate(value);
+        }
+
         // Apply runtime changes if terminal is open
         if (this.isOpen) {
           this.handleOptionChange(prop, value, oldValue);
@@ -171,6 +180,7 @@ export class Terminal implements ITerminalCore {
 
     this.cols = this.options.cols;
     this.rows = this.options.rows;
+    this.currentTheme = { ...DEFAULT_THEME, ...options.theme };
 
     // Initialize buffer API
     this.buffer = new BufferNamespace(this);
@@ -179,6 +189,13 @@ export class Terminal implements ITerminalCore {
   // ==========================================================================
   // Option Change Handling (for mutable options)
   // ==========================================================================
+
+  private resolveThemeUpdate(theme: unknown): Required<ITheme> {
+    const incoming = theme && typeof theme === 'object' ? (theme as ITheme) : {};
+    return Object.keys(incoming).length > 0
+      ? { ...this.currentTheme, ...incoming }
+      : { ...DEFAULT_THEME };
+  }
 
   /**
    * Handle runtime option changes (called when options are modified after terminal is open)
@@ -202,8 +219,11 @@ export class Terminal implements ITerminalCore {
         break;
 
       case 'theme':
-        if (this.renderer) {
-          console.warn('ghostty-web: theme changes after open() are not yet fully supported');
+        if (this.renderer && this.wasmTerm) {
+          this.currentTheme = this.resolveThemeUpdate(newValue);
+          this.renderer.setTheme(this.currentTheme);
+          this.wasmTerm.setColors(this.buildThemeColorsConfig(this.currentTheme));
+          this.performRender(true);
         }
         break;
 
@@ -324,6 +344,38 @@ export class Terminal implements ITerminalCore {
       bgColor: this.parseColorToHex(theme?.background),
       cursorColor: this.parseColorToHex(theme?.cursor),
       palette,
+    };
+  }
+
+  /**
+   * Build a WASM colors config from a fully resolved theme.
+   *
+   * Runtime color updates treat 0x000000 as a real color, so this must use
+   * DEFAULT_THEME-resolved values rather than sparse option values.
+   */
+  private buildThemeColorsConfig(theme: Required<ITheme>): GhosttyTerminalConfig {
+    return {
+      fgColor: this.parseColorToHex(theme.foreground),
+      bgColor: this.parseColorToHex(theme.background),
+      cursorColor: this.parseColorToHex(theme.cursor),
+      palette: [
+        this.parseColorToHex(theme.black),
+        this.parseColorToHex(theme.red),
+        this.parseColorToHex(theme.green),
+        this.parseColorToHex(theme.yellow),
+        this.parseColorToHex(theme.blue),
+        this.parseColorToHex(theme.magenta),
+        this.parseColorToHex(theme.cyan),
+        this.parseColorToHex(theme.white),
+        this.parseColorToHex(theme.brightBlack),
+        this.parseColorToHex(theme.brightRed),
+        this.parseColorToHex(theme.brightGreen),
+        this.parseColorToHex(theme.brightYellow),
+        this.parseColorToHex(theme.brightBlue),
+        this.parseColorToHex(theme.brightMagenta),
+        this.parseColorToHex(theme.brightCyan),
+        this.parseColorToHex(theme.brightWhite),
+      ],
     };
   }
 
@@ -522,7 +574,7 @@ export class Terminal implements ITerminalCore {
       parent.addEventListener('wheel', this.handleWheel, { passive: false, capture: true });
 
       // Render initial blank screen (force full redraw)
-      this.renderer.render(this.wasmTerm, true, this.viewportY, this, this.scrollbarOpacity);
+      this.performRender(true);
 
       // Start render loop
       this.startRenderLoop();
@@ -597,7 +649,7 @@ export class Terminal implements ITerminalCore {
     if (this.awaitingEcho) {
       this.awaitingEcho = false;
       if (this.renderer && this.wasmTerm) {
-        this.renderer.render(this.wasmTerm, false, this.viewportY, this, this.scrollbarOpacity);
+        this.performRender(false);
       }
     }
 
@@ -641,6 +693,36 @@ export class Terminal implements ITerminalCore {
       // Send data directly
       this.dataEmitter.fire(data);
     }
+  }
+
+  /**
+   * Request an explicit render pass.
+   *
+   * The normal render loop only paints rows marked dirty by the WASM render
+   * state. Embedders can use this to force a repaint after external canvas
+   * visibility/style changes.
+   */
+  requestRender(options: { full?: boolean } = {}): void {
+    this.assertOpen();
+    if (!this.renderer || !this.wasmTerm) return;
+
+    const forceAll = options.full === true;
+    if (forceAll) {
+      if (this.pendingRenderFrame !== undefined) {
+        cancelAnimationFrame(this.pendingRenderFrame);
+        this.pendingRenderFrame = undefined;
+      }
+      this.performRender(true);
+      return;
+    }
+
+    if (this.pendingRenderFrame !== undefined) return;
+    this.pendingRenderFrame = requestAnimationFrame(() => {
+      this.pendingRenderFrame = undefined;
+      if (!this.isDisposed && this.isOpen && this.renderer && this.wasmTerm) {
+        this.performRender(false);
+      }
+    });
   }
 
   /**
@@ -705,7 +787,7 @@ export class Terminal implements ITerminalCore {
       this.resizeEmitter.fire({ cols, rows });
 
       // Force full render
-      this.renderer!.render(this.wasmTerm!, true, this.viewportY, this);
+      this.performRender(true);
     } catch (e) {
       console.error('Terminal resize failed:', e);
     }
@@ -1101,6 +1183,10 @@ export class Terminal implements ITerminalCore {
 
     // Stop render loop and clear write queue
     this.cancelRenderLoop();
+    if (this.pendingRenderFrame !== undefined) {
+      cancelAnimationFrame(this.pendingRenderFrame);
+      this.pendingRenderFrame = undefined;
+    }
     this.writeQueue.length = 0;
 
     // Stop smooth scroll animation
@@ -1162,6 +1248,25 @@ export class Terminal implements ITerminalCore {
   }
 
   /**
+   * Render once and fire compatibility events for explicit/full renders.
+   */
+  private performRender(forceAll: boolean = false, emitRender: boolean = true): void {
+    if (!this.renderer || !this.wasmTerm) return;
+
+    this.renderer.render(this.wasmTerm, forceAll, this.viewportY, this, this.scrollbarOpacity);
+
+    const cursor = this.wasmTerm.getCursor();
+    if (cursor.y !== this.lastCursorY) {
+      this.lastCursorY = cursor.y;
+      this.cursorMoveEmitter.fire();
+    }
+
+    if (emitRender) {
+      this.renderEmitter.fire({ start: 0, end: this.rows - 1 });
+    }
+  }
+
+  /**
    * Start the render loop
    */
   private startRenderLoop(): void {
@@ -1173,19 +1278,7 @@ export class Terminal implements ITerminalCore {
         // 1. Calls update() once to sync state and check dirty flags
         // 2. Only redraws dirty rows when forceAll=false
         // 3. Always calls clearDirty() at the end
-        this.renderer!.render(this.wasmTerm!, false, this.viewportY, this, this.scrollbarOpacity);
-
-        // Check for cursor movement (Phase 2: onCursorMove event)
-        // Note: getCursor() reads from already-updated render state (from render() above)
-        const cursor = this.wasmTerm!.getCursor();
-        if (cursor.y !== this.lastCursorY) {
-          this.lastCursorY = cursor.y;
-          this.cursorMoveEmitter.fire();
-        }
-
-        // Note: onRender event is intentionally not fired in the render loop
-        // to avoid performance issues. For now, consumers can use requestAnimationFrame
-        // if they need frame-by-frame updates.
+        this.performRender(false, false);
 
         this.animationFrameId = requestAnimationFrame(loop);
       }

@@ -32,7 +32,7 @@ new file mode 100644
 index 000000000..c467102c3
 --- /dev/null
 +++ b/include/ghostty/vt/terminal.h
-@@ -0,0 +1,285 @@
+@@ -0,0 +1,292 @@
 +/**
 + * @file terminal.h
 + *
@@ -141,6 +141,13 @@ index 000000000..c467102c3
 +
 +/** Write data to terminal (parses VT sequences) */
 +void ghostty_terminal_write(GhosttyTerminal term, const uint8_t* data, size_t len);
++
++/**
++ * Update terminal default colors at runtime.
++ * OSC color overrides are preserved; only embedder-provided defaults change.
++ * Forces a full redraw on the next render cycle.
++ */
++void ghostty_terminal_set_colors(GhosttyTerminal term, const GhosttyTerminalConfig* config);
 +
 +/* ============================================================================
 + * RenderState API - High-performance rendering
@@ -322,7 +329,7 @@ diff --git a/src/lib_vt.zig b/src/lib_vt.zig
 index 03a883e20..1336676d7 100644
 --- a/src/lib_vt.zig
 +++ b/src/lib_vt.zig
-@@ -140,6 +140,45 @@ comptime {
+@@ -140,6 +140,46 @@ comptime {
          @export(&c.sgr_unknown_partial, .{ .name = "ghostty_sgr_unknown_partial" });
          @export(&c.sgr_attribute_tag, .{ .name = "ghostty_sgr_attribute_tag" });
          @export(&c.sgr_attribute_value, .{ .name = "ghostty_sgr_attribute_value" });
@@ -332,6 +339,7 @@ index 03a883e20..1336676d7 100644
 +        @export(&c.terminal_free, .{ .name = "ghostty_terminal_free" });
 +        @export(&c.terminal_resize, .{ .name = "ghostty_terminal_resize" });
 +        @export(&c.terminal_write, .{ .name = "ghostty_terminal_write" });
++        @export(&c.terminal_set_colors, .{ .name = "ghostty_terminal_set_colors" });
 +
 +        // RenderState API - high-performance rendering
 +        @export(&c.render_state_update, .{ .name = "ghostty_render_state_update" });
@@ -380,7 +388,7 @@ index bc92597f5..d0ee49c1b 100644
  
  // The full C API, unexported.
  pub const osc_new = osc.new;
-@@ -52,6 +53,46 @@ pub const key_encoder_encode = key_encode.encode;
+@@ -52,6 +53,47 @@ pub const key_encoder_encode = key_encode.encode;
  
  pub const paste_is_safe = paste.is_safe;
  
@@ -390,6 +398,7 @@ index bc92597f5..d0ee49c1b 100644
 +pub const terminal_free = terminal.free;
 +pub const terminal_resize = terminal.resize;
 +pub const terminal_write = terminal.write;
++pub const terminal_set_colors = terminal.setColors;
 +
 +// RenderState API - high-performance rendering
 +pub const render_state_update = terminal.renderStateUpdate;
@@ -427,7 +436,7 @@ index bc92597f5..d0ee49c1b 100644
  test {
      _ = color;
      _ = osc;
-@@ -59,6 +100,7 @@ test {
+@@ -59,6 +101,7 @@ test {
      _ = key_encode;
      _ = paste;
      _ = sgr;
@@ -440,7 +449,7 @@ new file mode 100644
 index 000000000..73ae2e6fa
 --- /dev/null
 +++ b/src/terminal/c/terminal.zig
-@@ -0,0 +1,1123 @@
+@@ -0,0 +1,1143 @@
 +//! C API wrapper for Terminal
 +//!
 +//! This provides a minimal, high-performance interface to Ghostty's Terminal
@@ -767,6 +776,8 @@ index 000000000..73ae2e6fa
 +    response_buffer: std.ArrayList(u8),
 +    /// Track alternate screen state to detect screen switches
 +    last_screen_is_alternate: bool = false,
++    /// Force a full redraw on next render (for runtime default color changes).
++    force_full_redraw: bool = false,
 +};
 +
 +/// C-compatible cell structure (16 bytes)
@@ -801,6 +812,28 @@ index 000000000..73ae2e6fa
 +    palette: [16]u32,
 +};
 +
++fn rgbFromPacked(value: u32) color.RGB {
++    return .{
++        .r = @truncate((value >> 16) & 0xFF),
++        .g = @truncate((value >> 8) & 0xFF),
++        .b = @truncate(value & 0xFF),
++    };
++}
++
++fn paletteFromConfig(
++    config: *const GhosttyTerminalConfig,
++    base: color.Palette,
++    comptime zero_is_default: bool,
++) color.Palette {
++    var palette = base;
++    for (config.palette, 0..) |palette_color, i| {
++        if (!zero_is_default or palette_color != 0) {
++            palette[i] = rgbFromPacked(palette_color);
++        }
++    }
++    return palette;
++}
++
 +// ============================================================================
 +// Lifecycle
 +// ============================================================================
@@ -831,40 +864,17 @@ index 000000000..73ae2e6fa
 +    var colors = Terminal.Colors.default;
 +    if (config_) |cfg| {
 +        if (cfg.fg_color != 0) {
-+            const rgb = color.RGB{
-+                .r = @truncate((cfg.fg_color >> 16) & 0xFF),
-+                .g = @truncate((cfg.fg_color >> 8) & 0xFF),
-+                .b = @truncate(cfg.fg_color & 0xFF),
-+            };
-+            colors.foreground = color.DynamicRGB.init(rgb);
++            colors.foreground = color.DynamicRGB.init(rgbFromPacked(cfg.fg_color));
 +        }
 +        if (cfg.bg_color != 0) {
-+            const rgb = color.RGB{
-+                .r = @truncate((cfg.bg_color >> 16) & 0xFF),
-+                .g = @truncate((cfg.bg_color >> 8) & 0xFF),
-+                .b = @truncate(cfg.bg_color & 0xFF),
-+            };
-+            colors.background = color.DynamicRGB.init(rgb);
++            colors.background = color.DynamicRGB.init(rgbFromPacked(cfg.bg_color));
 +        }
 +        if (cfg.cursor_color != 0) {
-+            const rgb = color.RGB{
-+                .r = @truncate((cfg.cursor_color >> 16) & 0xFF),
-+                .g = @truncate((cfg.cursor_color >> 8) & 0xFF),
-+                .b = @truncate(cfg.cursor_color & 0xFF),
-+            };
-+            colors.cursor = color.DynamicRGB.init(rgb);
++            colors.cursor = color.DynamicRGB.init(rgbFromPacked(cfg.cursor_color));
 +        }
-+        // Apply palette colors (0 = use default)
-+        for (cfg.palette, 0..) |palette_color, i| {
-+            if (palette_color != 0) {
-+                const rgb = color.RGB{
-+                    .r = @truncate((palette_color >> 16) & 0xFF),
-+                    .g = @truncate((palette_color >> 8) & 0xFF),
-+                    .b = @truncate(palette_color & 0xFF),
-+                };
-+                colors.palette.set(@intCast(i), rgb);
-+            }
-+        }
++        // Initial config uses 0 as a sentinel, but configured palette values
++        // must become defaults rather than OSC overrides.
++        colors.palette.changeDefault(paletteFromConfig(cfg, colors.palette.original, true));
 +    }
 +
 +    wrapper.terminal = Terminal.init(alloc, .{
@@ -927,6 +937,23 @@ index 000000000..73ae2e6fa
 +    wrapper.stream.nextSlice(data[0..len]) catch return;
 +}
 +
++/// Update terminal default colors at runtime. All color values in the config
++/// are applied directly, so 0x000000 is treated as valid black. Dynamic OSC
++/// overrides are preserved, matching Ghostty's native config reload behavior.
++pub fn setColors(ptr: ?*anyopaque, config_ptr: ?*const GhosttyTerminalConfig) callconv(.c) void {
++    const wrapper: *TerminalWrapper = @ptrCast(@alignCast(ptr orelse return));
++    const cfg = config_ptr orelse return;
++
++    wrapper.terminal.colors.foreground.default = rgbFromPacked(cfg.fg_color);
++    wrapper.terminal.colors.background.default = rgbFromPacked(cfg.bg_color);
++    wrapper.terminal.colors.cursor.default = rgbFromPacked(cfg.cursor_color);
++    wrapper.terminal.colors.palette.changeDefault(
++        paletteFromConfig(cfg, wrapper.terminal.colors.palette.original, false),
++    );
++    wrapper.terminal.flags.dirty.palette = true;
++    wrapper.force_full_redraw = true;
++}
++
 +// ============================================================================
 +// RenderState API - High-performance rendering
 +// ============================================================================
@@ -935,26 +962,28 @@ index 000000000..73ae2e6fa
 +/// Returns dirty state: 0=none, 1=partial, 2=full
 +pub fn renderStateUpdate(ptr: ?*anyopaque) callconv(.c) GhosttyDirty {
 +    const wrapper: *TerminalWrapper = @ptrCast(@alignCast(ptr orelse return .full));
-+    
++
 +    // Detect screen buffer switch (normal <-> alternate)
 +    const current_is_alternate = wrapper.terminal.screens.active_key == .alternate;
 +    const screen_switched = current_is_alternate != wrapper.last_screen_is_alternate;
 +    wrapper.last_screen_is_alternate = current_is_alternate;
-+    
-+    // When screen switches, we must fully reset the render state to avoid
-+    // stale cached cell data from the previous screen buffer.
-+    if (screen_switched) {
++
++    // When screen switches or default colors change, we must fully reset the
++    // render state to avoid stale cached cell data.
++    const needs_full_reset = screen_switched or wrapper.force_full_redraw;
++    if (needs_full_reset) {
 +        wrapper.render_state.deinit(wrapper.alloc);
 +        wrapper.render_state = RenderState.empty;
++        wrapper.force_full_redraw = false;
 +    }
-+    
++
 +    wrapper.render_state.update(wrapper.alloc, &wrapper.terminal) catch return .full;
-+    
-+    // If screen switched, always return full dirty to force complete redraw
-+    if (screen_switched) {
++
++    // If we reset state, always return full dirty to force complete redraw.
++    if (needs_full_reset) {
 +        return .full;
 +    }
-+    
++
 +    return switch (wrapper.render_state.dirty) {
 +        .false => .none,
 +        .partial => .partial,
@@ -979,7 +1008,7 @@ index 000000000..73ae2e6fa
 +    return @intCast(wrapper.render_state.cursor.active.x);
 +}
 +
-+/// Get cursor Y position  
++/// Get cursor Y position
 +pub fn renderStateGetCursorY(ptr: ?*anyopaque) callconv(.c) c_int {
 +    const wrapper: *const TerminalWrapper = @ptrCast(@alignCast(ptr orelse return 0));
 +    return @intCast(wrapper.render_state.cursor.active.y);
@@ -1245,22 +1274,22 @@ index 000000000..73ae2e6fa
 +    const wrapper: *const TerminalWrapper = @ptrCast(@alignCast(ptr orelse return -1));
 +    const rs = &wrapper.render_state;
 +    const cols = rs.cols;
-+    
++
 +    if (buf_size < cols) return -1;
 +    if (offset < 0) return -1;
-+    
++
 +    const scrollback_len = getScrollbackLength(ptr);
 +    if (offset >= scrollback_len) return -1;
-+    
++
 +    // Get the pin for this scrollback row
 +    // history point: y=0 is oldest, y=scrollback_len-1 is newest
 +    const pages = &wrapper.terminal.screens.active.pages;
 +    const pin = pages.pin(.{ .history = .{ .y = @intCast(offset) } }) orelse return -1;
-+    
++
 +    // Get cells for this row
 +    const cells = pin.cells(.all);
 +    const page = pin.node.data;
-+    
++
 +    // Fill output buffer
 +    for (0..cols) |x| {
 +        if (x >= cells.len) {
@@ -1279,15 +1308,15 @@ index 000000000..73ae2e6fa
 +            };
 +            continue;
 +        }
-+        
++
 +        const cell = &cells[x];
-+        
++
 +        // Get style from page styles (cell has style_id)
 +        const sty: Style = if (cell.style_id > 0)
 +            page.styles.get(page.memory, cell.style_id).*
 +        else
 +            .{};
-+        
++
 +        // Resolve colors
 +        const fg: color.RGB = switch (sty.fg_color) {
 +            .none => rs.colors.foreground,
@@ -1295,7 +1324,7 @@ index 000000000..73ae2e6fa
 +            .rgb => |rgb| rgb,
 +        };
 +        const bg: color.RGB = if (sty.bg(cell, &rs.colors.palette)) |rgb| rgb else rs.colors.background;
-+        
++
 +        // Build flags
 +        var flags: u8 = 0;
 +        if (sty.flags.bold) flags |= 1 << 0;
@@ -1391,11 +1420,11 @@ index 000000000..73ae2e6fa
 +pub fn isRowWrapped(ptr: ?*anyopaque, y: c_int) callconv(.c) bool {
 +    const wrapper: *const TerminalWrapper = @ptrCast(@alignCast(ptr orelse return false));
 +    const pages = &wrapper.terminal.screens.active.pages;
-+    
++
 +    // Get pin for this row in active area
 +    const pin = pages.pin(.{ .active = .{ .y = @intCast(y) } }) orelse return false;
 +    const rac = pin.rowAndCell();
-+    
++
 +    // wrap_continuation means this row continues from the previous row
 +    return rac.row.wrap_continuation;
 +}
@@ -1515,9 +1544,9 @@ index 000000000..73ae2e6fa
 +    const wrapper: *TerminalWrapper = @ptrCast(@alignCast(ptr orelse return -1));
 +    const len = @min(wrapper.response_buffer.items.len, buf_size);
 +    if (len == 0) return 0;
-+    
++
 +    @memcpy(out[0..len], wrapper.response_buffer.items[0..len]);
-+    
++
 +    // Remove consumed bytes from buffer
 +    if (len == wrapper.response_buffer.items.len) {
 +        wrapper.response_buffer.clearRetainingCapacity();
@@ -1530,7 +1559,7 @@ index 000000000..73ae2e6fa
 +        );
 +        wrapper.response_buffer.shrinkRetainingCapacity(wrapper.response_buffer.items.len - len);
 +    }
-+    
++
 +    return @intCast(len);
 +}
 +

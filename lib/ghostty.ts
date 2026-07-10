@@ -364,6 +364,44 @@ export class GhosttyTerminal {
     this.exports.ghostty_terminal_free(this.handle);
   }
 
+  /**
+   * Update terminal default colors at runtime.
+   *
+   * This preserves colors explicitly changed by OSC sequences while refreshing
+   * the embedder-provided defaults, matching Ghostty's native config reload path.
+   */
+  setColors(config: GhosttyTerminalConfig): void {
+    const configPtr = this.exports.ghostty_wasm_alloc_u8_array(GHOSTTY_CONFIG_SIZE);
+    if (configPtr === 0) return;
+
+    try {
+      const view = new DataView(this.memory.buffer);
+      let offset = configPtr;
+
+      // scrollback_limit (u32) - ignored by setColors, but present in the ABI struct.
+      view.setUint32(offset, 0, true);
+      offset += 4;
+
+      view.setUint32(offset, config.fgColor ?? 0, true);
+      offset += 4;
+
+      view.setUint32(offset, config.bgColor ?? 0, true);
+      offset += 4;
+
+      view.setUint32(offset, config.cursorColor ?? 0, true);
+      offset += 4;
+
+      for (let i = 0; i < 16; i++) {
+        view.setUint32(offset, config.palette?.[i] ?? 0, true);
+        offset += 4;
+      }
+
+      this.exports.ghostty_terminal_set_colors(this.handle, configPtr);
+    } finally {
+      this.exports.ghostty_wasm_free_u8_array(configPtr, GHOSTTY_CONFIG_SIZE);
+    }
+  }
+
   // ==========================================================================
   // RenderState API - The key performance optimization
   // ==========================================================================
