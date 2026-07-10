@@ -25,32 +25,14 @@ else
     echo "📦 Ghostty submodule already initialized"
 fi
 
-# Apply patch
-echo "🔧 Applying WASM API patch..."
-cd ghostty
-git apply --check ../patches/ghostty-wasm-api.patch || {
-    echo "❌ Patch doesn't apply cleanly"
-    echo "Ghostty may have changed. Check patches/ghostty-wasm-api.patch"
-    exit 1
-}
-git apply ../patches/ghostty-wasm-api.patch
-
 # Build WASM
 echo "⚙️  Building WASM (takes ~20 seconds)..."
+cd ghostty
 zig build lib-vt -Dtarget=wasm32-freestanding -Doptimize=ReleaseSmall
 
 # Copy to project root
 cd ..
 cp ghostty/zig-out/bin/ghostty-vt.wasm ./
-
-# Revert patch to keep submodule clean
-echo "🧹 Cleaning up..."
-cd ghostty
-git apply -R ../patches/ghostty-wasm-api.patch
-# Remove new files created by the patch
-rm -f include/ghostty/vt/terminal.h
-rm -f src/terminal/c/terminal.zig
-cd ..
 
 SIZE=$(du -h ghostty-vt.wasm | cut -f1)
 echo "✅ Built ghostty-vt.wasm ($SIZE)"

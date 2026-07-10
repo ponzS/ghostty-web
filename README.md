@@ -69,8 +69,8 @@ For a comprehensive client <-> server example, refer to the [demo](./demo/index.
 
 ## Development
 
-ghostty-web builds from Ghostty's source with a [patch](./patches/ghostty-wasm-api.patch) to expose additional
-functionality.
+ghostty-web builds from the [`ponzS/ghostty`](https://github.com/ponzS/ghostty) submodule, which carries the
+WASM terminal API used by this project.
 
 > Requires Zig and Bun.
 
