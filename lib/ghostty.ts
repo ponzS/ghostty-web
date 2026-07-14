@@ -257,9 +257,14 @@ export class GhosttyTerminal {
   private handle: TerminalHandle;
   private _cols: number;
   private _rows: number;
+  private readonly logicalScrollbackLimit: number;
 
   /** Size of GhosttyCell in WASM (16 bytes) */
   private static readonly CELL_SIZE = 16;
+
+  /** Ghostty allocates scrollback in 512 KiB pages, and the config value is bytes. */
+  private static readonly SCROLLBACK_PAGE_SIZE = 512 * 1024;
+  private static readonly MAX_SCROLLBACK_BYTES = 0x7fffffff;
 
   /** Reusable buffer for viewport operations */
   private viewportBufferPtr: number = 0;
@@ -279,48 +284,46 @@ export class GhosttyTerminal {
     this.memory = memory;
     this._cols = cols;
     this._rows = rows;
+    this.logicalScrollbackLimit = GhosttyTerminal.normalizeScrollbackLimit(config?.scrollbackLimit);
 
-    if (config) {
-      // Allocate config struct in WASM memory
-      const configPtr = this.exports.ghostty_wasm_alloc_u8_array(GHOSTTY_CONFIG_SIZE);
-      if (configPtr === 0) {
-        throw new Error('Failed to allocate config (out of memory)');
+    // Allocate config struct in WASM memory. Ghostty interprets scrollback_limit
+    // as bytes, while ghostty-web exposes it as lines.
+    const configPtr = this.exports.ghostty_wasm_alloc_u8_array(GHOSTTY_CONFIG_SIZE);
+    if (configPtr === 0) {
+      throw new Error('Failed to allocate config (out of memory)');
+    }
+
+    try {
+      // Write config to WASM memory
+      const view = new DataView(this.memory.buffer);
+      let offset = configPtr;
+
+      // scrollback_limit (u32 bytes)
+      view.setUint32(offset, this.estimateScrollbackBytes(), true);
+      offset += 4;
+
+      // fg_color (u32)
+      view.setUint32(offset, config?.fgColor ?? 0, true);
+      offset += 4;
+
+      // bg_color (u32)
+      view.setUint32(offset, config?.bgColor ?? 0, true);
+      offset += 4;
+
+      // cursor_color (u32)
+      view.setUint32(offset, config?.cursorColor ?? 0, true);
+      offset += 4;
+
+      // palette[16] (u32 * 16)
+      for (let i = 0; i < 16; i++) {
+        view.setUint32(offset, config?.palette?.[i] ?? 0, true);
+        offset += 4;
       }
 
-      try {
-        // Write config to WASM memory
-        const view = new DataView(this.memory.buffer);
-        let offset = configPtr;
-
-        // scrollback_limit (u32)
-        view.setUint32(offset, config.scrollbackLimit ?? 10000, true);
-        offset += 4;
-
-        // fg_color (u32)
-        view.setUint32(offset, config.fgColor ?? 0, true);
-        offset += 4;
-
-        // bg_color (u32)
-        view.setUint32(offset, config.bgColor ?? 0, true);
-        offset += 4;
-
-        // cursor_color (u32)
-        view.setUint32(offset, config.cursorColor ?? 0, true);
-        offset += 4;
-
-        // palette[16] (u32 * 16)
-        for (let i = 0; i < 16; i++) {
-          view.setUint32(offset, config.palette?.[i] ?? 0, true);
-          offset += 4;
-        }
-
-        this.handle = this.exports.ghostty_terminal_new_with_config(cols, rows, configPtr);
-      } finally {
-        // Free the config memory
-        this.exports.ghostty_wasm_free_u8_array(configPtr, GHOSTTY_CONFIG_SIZE);
-      }
-    } else {
-      this.handle = this.exports.ghostty_terminal_new(cols, rows);
+      this.handle = this.exports.ghostty_terminal_new_with_config(cols, rows, configPtr);
+    } finally {
+      // Free the config memory
+      this.exports.ghostty_wasm_free_u8_array(configPtr, GHOSTTY_CONFIG_SIZE);
     }
 
     if (!this.handle) throw new Error('Failed to create terminal');
@@ -333,6 +336,37 @@ export class GhosttyTerminal {
   }
   get rows(): number {
     return this._rows;
+  }
+
+  private static normalizeScrollbackLimit(limit?: number): number {
+    if (limit === undefined) return 10000;
+    if (!Number.isFinite(limit)) return 10000;
+    return Math.max(0, Math.floor(limit));
+  }
+
+  private estimateScrollbackBytes(): number {
+    const estimatedBytes =
+      (this.logicalScrollbackLimit + Math.max(1, this._rows)) *
+      (Math.max(1, this._cols) + 64) *
+      GhosttyTerminal.CELL_SIZE;
+    const bytesWithHeadroom = Number.isFinite(estimatedBytes)
+      ? estimatedBytes + GhosttyTerminal.SCROLLBACK_PAGE_SIZE
+      : GhosttyTerminal.MAX_SCROLLBACK_BYTES;
+    return Math.min(
+      GhosttyTerminal.MAX_SCROLLBACK_BYTES,
+      Math.max(2 * GhosttyTerminal.SCROLLBACK_PAGE_SIZE, Math.ceil(bytesWithHeadroom))
+    );
+  }
+
+  private getRawScrollbackLength(): number {
+    return this.exports.ghostty_terminal_get_scrollback_length(this.handle);
+  }
+
+  private getRawScrollbackOffset(offset: number): number | null {
+    const rawLength = this.getRawScrollbackLength();
+    const logicalLength = Math.min(rawLength, this.logicalScrollbackLimit);
+    if (!Number.isInteger(offset) || offset < 0 || offset >= logicalLength) return null;
+    return rawLength - logicalLength + offset;
   }
 
   // ==========================================================================
@@ -541,7 +575,7 @@ export class GhosttyTerminal {
 
   /** Get number of scrollback lines (history, not including active screen) */
   getScrollbackLength(): number {
-    return this.exports.ghostty_terminal_get_scrollback_length(this.handle);
+    return Math.min(this.getRawScrollbackLength(), this.logicalScrollbackLimit);
   }
 
   /**
@@ -550,6 +584,9 @@ export class GhosttyTerminal {
    * @param offset 0 = oldest line, (length-1) = most recent scrollback line
    */
   getScrollbackLine(offset: number): GhosttyCell[] | null {
+    const rawOffset = this.getRawScrollbackOffset(offset);
+    if (rawOffset === null) return null;
+
     const neededSize = this._cols * GhosttyTerminal.CELL_SIZE;
 
     // Ensure buffer is allocated
@@ -565,9 +602,13 @@ export class GhosttyTerminal {
     // This is safe to call multiple times - dirty state persists until markClean().
     this.update();
 
+    // Ghostty only writes populated cells. Clear the reusable buffer so shorter
+    // lines cannot inherit trailing cells from a previous viewport or line read.
+    new Uint8Array(this.memory.buffer, this.viewportBufferPtr, neededSize).fill(0);
+
     const count = this.exports.ghostty_terminal_get_scrollback_line(
       this.handle,
-      offset,
+      rawOffset,
       this.viewportBufferPtr,
       this._cols
     );
@@ -664,6 +705,9 @@ export class GhosttyTerminal {
       return null;
     }
 
+    const rawOffset = this.getRawScrollbackOffset(offset);
+    if (rawOffset === null) return null;
+
     // Try with initial buffer, retry with larger if needed (for very long URLs)
     const bufferSizes = [2048, 8192, 32768];
 
@@ -673,7 +717,7 @@ export class GhosttyTerminal {
       try {
         const bytesWritten = this.exports.ghostty_terminal_get_scrollback_hyperlink_uri(
           this.handle,
-          offset,
+          rawOffset,
           col,
           bufPtr,
           bufSize
@@ -838,6 +882,9 @@ export class GhosttyTerminal {
    * @returns Array of codepoints, or null on error
    */
   getScrollbackGrapheme(offset: number, col: number): number[] | null {
+    const rawOffset = this.getRawScrollbackOffset(offset);
+    if (rawOffset === null) return null;
+
     // Reuse the same buffer as getGrapheme
     if (!this.graphemeBuffer) {
       this.graphemeBufferPtr = this.exports.ghostty_wasm_alloc_u8_array(16 * 4);
@@ -846,7 +893,7 @@ export class GhosttyTerminal {
 
     const count = this.exports.ghostty_terminal_get_scrollback_grapheme(
       this.handle,
-      offset,
+      rawOffset,
       col,
       this.graphemeBufferPtr,
       16

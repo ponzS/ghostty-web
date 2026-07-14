@@ -532,6 +532,7 @@ export const COLORS_STRUCT_SIZE = 12;
  * All color values use 0xRRGGBB format. A value of 0 means "use default".
  */
 export interface GhosttyTerminalConfig {
+  /** Maximum scrollback history exposed by ghostty-web, in lines. */
   scrollbackLimit?: number;
   fgColor?: number;
   bgColor?: number;
