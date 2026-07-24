@@ -24,12 +24,14 @@ let ghosttyInstance: Ghostty | null = null;
  * const term = new Terminal();
  * term.open(document.getElementById('terminal'));
  * ```
+ *
+ * @param wasmPath Optional URL or filesystem path to the Ghostty WASM module.
  */
-export async function init(): Promise<void> {
+export async function init(wasmPath?: string): Promise<void> {
   if (ghosttyInstance) {
     return; // Already initialized
   }
-  ghosttyInstance = await Ghostty.load();
+  ghosttyInstance = await Ghostty.load(wasmPath);
 }
 
 /**

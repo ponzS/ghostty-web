@@ -32,7 +32,7 @@ new file mode 100644
 index 000000000..c467102c3
 --- /dev/null
 +++ b/include/ghostty/vt/terminal.h
-@@ -0,0 +1,285 @@
+@@ -0,0 +1,287 @@
 +/**
 + * @file terminal.h
 + *
@@ -138,6 +138,8 @@ index 000000000..c467102c3
 +
 +/** Resize terminal */
 +void ghostty_terminal_resize(GhosttyTerminal term, int cols, int rows);
++/** Raise the native scrollback byte capacity before a wider reflow. */
++void ghostty_terminal_set_scrollback_limit(GhosttyTerminal term, uint32_t max_bytes);
 +
 +/** Write data to terminal (parses VT sequences) */
 +void ghostty_terminal_write(GhosttyTerminal term, const uint8_t* data, size_t len);
@@ -322,7 +324,7 @@ diff --git a/src/lib_vt.zig b/src/lib_vt.zig
 index 03a883e20..1336676d7 100644
 --- a/src/lib_vt.zig
 +++ b/src/lib_vt.zig
-@@ -140,6 +140,45 @@ comptime {
+@@ -140,6 +140,46 @@ comptime {
          @export(&c.sgr_unknown_partial, .{ .name = "ghostty_sgr_unknown_partial" });
          @export(&c.sgr_attribute_tag, .{ .name = "ghostty_sgr_attribute_tag" });
          @export(&c.sgr_attribute_value, .{ .name = "ghostty_sgr_attribute_value" });
@@ -331,6 +333,7 @@ index 03a883e20..1336676d7 100644
 +        @export(&c.terminal_new_with_config, .{ .name = "ghostty_terminal_new_with_config" });
 +        @export(&c.terminal_free, .{ .name = "ghostty_terminal_free" });
 +        @export(&c.terminal_resize, .{ .name = "ghostty_terminal_resize" });
++        @export(&c.terminal_set_scrollback_limit, .{ .name = "ghostty_terminal_set_scrollback_limit" });
 +        @export(&c.terminal_write, .{ .name = "ghostty_terminal_write" });
 +
 +        // RenderState API - high-performance rendering
@@ -380,7 +383,7 @@ index bc92597f5..d0ee49c1b 100644
  
  // The full C API, unexported.
  pub const osc_new = osc.new;
-@@ -52,6 +53,46 @@ pub const key_encoder_encode = key_encode.encode;
+@@ -52,6 +53,47 @@ pub const key_encoder_encode = key_encode.encode;
  
  pub const paste_is_safe = paste.is_safe;
  
@@ -389,6 +392,7 @@ index bc92597f5..d0ee49c1b 100644
 +pub const terminal_new_with_config = terminal.newWithConfig;
 +pub const terminal_free = terminal.free;
 +pub const terminal_resize = terminal.resize;
++pub const terminal_set_scrollback_limit = terminal.setScrollbackLimit;
 +pub const terminal_write = terminal.write;
 +
 +// RenderState API - high-performance rendering
@@ -440,7 +444,7 @@ new file mode 100644
 index 000000000..73ae2e6fa
 --- /dev/null
 +++ b/src/terminal/c/terminal.zig
-@@ -0,0 +1,1123 @@
+@@ -0,0 +1,1132 @@
 +//! C API wrapper for Terminal
 +//!
 +//! This provides a minimal, high-performance interface to Ghostty's Terminal
@@ -920,6 +924,15 @@ index 000000000..73ae2e6fa
 +pub fn resize(ptr: ?*anyopaque, cols: c_int, rows: c_int) callconv(.c) void {
 +    const wrapper: *TerminalWrapper = @ptrCast(@alignCast(ptr orelse return));
 +    wrapper.terminal.resize(wrapper.alloc, @intCast(cols), @intCast(rows)) catch return;
++}
++
++pub fn setScrollbackLimit(ptr: ?*anyopaque, max_bytes: u32) callconv(.c) void {
++    const wrapper: *TerminalWrapper = @ptrCast(@alignCast(ptr orelse return));
++    const limit: usize = if (max_bytes == 0) std.math.maxInt(usize) else max_bytes;
++    const primary = wrapper.terminal.screens.get(.primary) orelse return;
++    if (limit > primary.pages.explicit_max_size) {
++        primary.pages.explicit_max_size = limit;
++    }
 +}
 +
 +pub fn write(ptr: ?*anyopaque, data: [*]const u8, len: usize) callconv(.c) void {
