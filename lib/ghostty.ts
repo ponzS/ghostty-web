@@ -258,6 +258,7 @@ export class GhosttyTerminal {
   private _cols: number;
   private _rows: number;
   private readonly logicalScrollbackLimit: number;
+  private scrollbackByteCapacity: number;
 
   /** Size of GhosttyCell in WASM (16 bytes) */
   private static readonly CELL_SIZE = 16;
@@ -285,6 +286,7 @@ export class GhosttyTerminal {
     this._cols = cols;
     this._rows = rows;
     this.logicalScrollbackLimit = GhosttyTerminal.normalizeScrollbackLimit(config?.scrollbackLimit);
+    this.scrollbackByteCapacity = this.estimateScrollbackBytes(cols, rows);
 
     // Allocate config struct in WASM memory. Ghostty interprets scrollback_limit
     // as bytes, while ghostty-web exposes it as lines.
@@ -299,7 +301,7 @@ export class GhosttyTerminal {
       let offset = configPtr;
 
       // scrollback_limit (u32 bytes)
-      view.setUint32(offset, this.estimateScrollbackBytes(), true);
+      view.setUint32(offset, this.scrollbackByteCapacity, true);
       offset += 4;
 
       // fg_color (u32)
@@ -344,10 +346,10 @@ export class GhosttyTerminal {
     return Math.max(0, Math.floor(limit));
   }
 
-  private estimateScrollbackBytes(): number {
+  private estimateScrollbackBytes(cols: number, rows: number): number {
     const estimatedBytes =
-      (this.logicalScrollbackLimit + Math.max(1, this._rows)) *
-      (Math.max(1, this._cols) + 64) *
+      (this.logicalScrollbackLimit + Math.max(1, rows)) *
+      (Math.max(1, cols) + 64) *
       GhosttyTerminal.CELL_SIZE;
     const bytesWithHeadroom = Number.isFinite(estimatedBytes)
       ? estimatedBytes + GhosttyTerminal.SCROLLBACK_PAGE_SIZE
@@ -356,6 +358,14 @@ export class GhosttyTerminal {
       GhosttyTerminal.MAX_SCROLLBACK_BYTES,
       Math.max(2 * GhosttyTerminal.SCROLLBACK_PAGE_SIZE, Math.ceil(bytesWithHeadroom))
     );
+  }
+
+  private ensureScrollbackCapacity(cols: number, rows: number): void {
+    const nextCapacity = this.estimateScrollbackBytes(cols, rows);
+    if (nextCapacity <= this.scrollbackByteCapacity) return;
+
+    this.exports.ghostty_terminal_set_scrollback_limit(this.handle, nextCapacity);
+    this.scrollbackByteCapacity = nextCapacity;
   }
 
   private getRawScrollbackLength(): number {
@@ -383,6 +393,7 @@ export class GhosttyTerminal {
 
   resize(cols: number, rows: number): void {
     if (cols === this._cols && rows === this._rows) return;
+    this.ensureScrollbackCapacity(cols, rows);
     this._cols = cols;
     this._rows = rows;
     this.exports.ghostty_terminal_resize(this.handle, cols, rows);

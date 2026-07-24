@@ -412,6 +412,7 @@ export interface GhosttyWasmExports extends WebAssembly.Exports {
   ghostty_terminal_new_with_config(cols: number, rows: number, configPtr: number): TerminalHandle;
   ghostty_terminal_free(terminal: TerminalHandle): void;
   ghostty_terminal_resize(terminal: TerminalHandle, cols: number, rows: number): void;
+  ghostty_terminal_set_scrollback_limit(terminal: TerminalHandle, maxBytes: number): void;
   ghostty_terminal_write(terminal: TerminalHandle, dataPtr: number, dataLen: number): void;
 
   // RenderState API - high-performance rendering (ONE call gets ALL data)

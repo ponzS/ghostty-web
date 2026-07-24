@@ -56,4 +56,22 @@ describe('GhosttyTerminal scrollback line limits', () => {
       terminal.free();
     }
   });
+
+  test('keeps the configured history after widening the terminal', async () => {
+    const ghostty = await Ghostty.load();
+    const terminal = ghostty.createTerminal(80, 28, { scrollbackLimit: 5000 });
+
+    try {
+      terminal.write(numberedLines(6000));
+      expect(terminal.getScrollbackLength()).toBe(5000);
+
+      terminal.resize(500, 28);
+
+      expect(terminal.getScrollbackLength()).toBe(5000);
+      expect(lineText(terminal, 0)).toBe('974');
+      expect(lineText(terminal, 4999)).toBe('5973');
+    } finally {
+      terminal.free();
+    }
+  });
 });
