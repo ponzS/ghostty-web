@@ -18,6 +18,7 @@ import { CellFlags } from './types';
 // Interface for objects that can be rendered
 export interface IRenderable {
   getLine(y: number): GhosttyCell[] | null;
+  getViewport?(): GhosttyCell[] | null;
   getCursor(): { x: number; y: number; visible: boolean };
   getDimensions(): { cols: number; rows: number };
   isRowDirty(y: number): boolean;
@@ -35,6 +36,7 @@ export interface IRenderable {
 export interface IScrollbackProvider {
   getScrollbackLine(offset: number): GhosttyCell[] | null;
   getScrollbackLength(): number;
+  normalizeViewportBounds?(viewportY?: number): number;
 }
 
 // ============================================================================
@@ -92,6 +94,7 @@ export const DEFAULT_THEME: Required<ITheme> = {
 // ============================================================================
 
 export class CanvasRenderer {
+  public onCursorBlink?: () => void;
   private canvas: HTMLCanvasElement;
   private ctx: CanvasRenderingContext2D;
   private fontSize: number;
@@ -113,6 +116,7 @@ export class CanvasRenderer {
 
   // Current buffer being rendered (for grapheme lookups)
   private currentBuffer: IRenderable | null = null;
+  private viewportSnapshotCells: GhosttyCell[] = [];
 
   // Selection manager (for rendering selection)
   private selectionManager?: SelectionManager;
@@ -257,6 +261,101 @@ export class CanvasRenderer {
     this.ctx.fillRect(0, 0, cssWidth, cssHeight);
   }
 
+  private copySnapshotCell(target: GhosttyCell, source: GhosttyCell, text: string): GhosttyCell {
+    target.codepoint = source.codepoint;
+    target.fg_r = source.fg_r;
+    target.fg_g = source.fg_g;
+    target.fg_b = source.fg_b;
+    target.bg_r = source.bg_r;
+    target.bg_g = source.bg_g;
+    target.bg_b = source.bg_b;
+    target.flags = source.flags;
+    target.width = source.width;
+    target.hyperlink_id = source.hyperlink_id;
+    target.grapheme_len = source.grapheme_len;
+    target.text = text;
+    return target;
+  }
+
+  private snapshotViewport(
+    buffer: IRenderable,
+    dims: { cols: number; rows: number }
+  ): GhosttyCell[] | null {
+    if (typeof buffer.getViewport !== 'function') return null;
+
+    const viewport = buffer.getViewport();
+    const totalCells = dims.cols * dims.rows;
+    if (!viewport || viewport.length < totalCells) return null;
+
+    while (this.viewportSnapshotCells.length < totalCells) {
+      this.viewportSnapshotCells.push({
+        codepoint: 0,
+        fg_r: 204,
+        fg_g: 204,
+        fg_b: 204,
+        bg_r: 0,
+        bg_g: 0,
+        bg_b: 0,
+        flags: 0,
+        width: 1,
+        hyperlink_id: 0,
+        grapheme_len: 0,
+        text: ' ',
+      });
+    }
+
+    for (let index = 0; index < totalCells; index++) {
+      const source = viewport[index];
+      const row = Math.floor(index / dims.cols);
+      const col = index % dims.cols;
+      const text =
+        source.text ??
+        (source.grapheme_len > 0 && buffer.getGraphemeString
+          ? buffer.getGraphemeString(row, col)
+          : String.fromCodePoint(source.codepoint || 32));
+      this.copySnapshotCell(this.viewportSnapshotCells[index], source, text);
+    }
+
+    return this.viewportSnapshotCells;
+  }
+
+  private materializeViewportLines(
+    buffer: IRenderable,
+    dims: { cols: number; rows: number },
+    viewportY: number,
+    scrollbackLength: number,
+    scrollbackProvider?: IScrollbackProvider
+  ): Map<number, GhosttyCell[]> | null {
+    const viewportLine = Math.max(0, Math.floor(viewportY));
+    const supportsViewportSnapshot = typeof buffer.getViewport === 'function';
+    const activeSnapshot = this.snapshotViewport(buffer, dims);
+    if (supportsViewportSnapshot && !activeSnapshot) return null;
+    const lines = new Map<number, GhosttyCell[]>();
+
+    for (let y = 0; y < dims.rows; y++) {
+      let line: GhosttyCell[] | null;
+      if (viewportLine > 0 && y < viewportLine) {
+        if (!scrollbackProvider) return null;
+        const scrollbackOffset = scrollbackLength - viewportLine + y;
+        line = scrollbackProvider.getScrollbackLine(scrollbackOffset);
+      } else {
+        const screenRow = y - viewportLine;
+        if (screenRow < 0 || screenRow >= dims.rows) return null;
+        if (activeSnapshot) {
+          const start = screenRow * dims.cols;
+          line = activeSnapshot.slice(start, start + dims.cols);
+        } else {
+          line = buffer.getLine(screenRow);
+        }
+      }
+
+      if (!line) return null;
+      lines.set(y, line);
+    }
+
+    return lines;
+  }
+
   // ==========================================================================
   // Main Rendering
   // ==========================================================================
@@ -270,19 +369,31 @@ export class CanvasRenderer {
     viewportY: number = 0,
     scrollbackProvider?: IScrollbackProvider,
     scrollbarOpacity: number = 1
-  ): void {
+  ): boolean {
     // Store buffer reference for grapheme lookups in renderCell
     this.currentBuffer = buffer;
 
-    // getCursor() calls update() internally to ensure fresh state.
-    // Multiple update() calls are safe - dirty state persists until clearDirty().
     const cursor = buffer.getCursor();
     const dims = buffer.getDimensions();
     const scrollbackLength = scrollbackProvider ? scrollbackProvider.getScrollbackLength() : 0;
+    const requestedViewportY = Number.isFinite(viewportY) ? viewportY : 0;
+    viewportY = scrollbackProvider?.normalizeViewportBounds
+      ? scrollbackProvider.normalizeViewportBounds(requestedViewportY)
+      : Math.max(0, Math.min(scrollbackLength, requestedViewportY));
 
-    // Check if buffer needs full redraw (e.g., screen change between normal/alternate)
     if (buffer.needsFullRedraw?.()) {
       forceAll = true;
+    }
+
+    const visibleLines = this.materializeViewportLines(
+      buffer,
+      dims,
+      viewportY,
+      scrollbackLength,
+      scrollbackProvider
+    );
+    if (!visibleLines) {
+      return false;
     }
 
     // Resize canvas if dimensions changed
@@ -298,31 +409,10 @@ export class CanvasRenderer {
     // Force re-render when viewport changes (scrolling)
     if (viewportY !== this.lastViewportY) {
       forceAll = true;
-      this.lastViewportY = viewportY;
     }
 
-    // Check if cursor position changed or if blinking (need to redraw cursor line)
     const cursorMoved =
       cursor.x !== this.lastCursorPosition.x || cursor.y !== this.lastCursorPosition.y;
-    if (cursorMoved || this.cursorBlink) {
-      // Mark cursor lines as needing redraw
-      if (!forceAll && !buffer.isRowDirty(cursor.y)) {
-        // Need to redraw cursor line
-        const line = buffer.getLine(cursor.y);
-        if (line) {
-          this.renderLine(line, cursor.y, dims.cols);
-        }
-      }
-      if (cursorMoved && this.lastCursorPosition.y !== cursor.y) {
-        // Also redraw old cursor line if cursor moved to different line
-        if (!forceAll && !buffer.isRowDirty(this.lastCursorPosition.y)) {
-          const line = buffer.getLine(this.lastCursorPosition.y);
-          if (line) {
-            this.renderLine(line, this.lastCursorPosition.y, dims.cols);
-          }
-        }
-      }
-    }
 
     // Check if we need to redraw selection-related lines
     const hasSelection = this.selectionManager && this.selectionManager.hasSelection();
@@ -347,8 +437,6 @@ export class CanvasRenderer {
         for (const row of dirtyRows) {
           selectionRows.add(row);
         }
-        // Clear the dirty rows tracking after marking for redraw
-        this.selectionManager.clearDirtySelectionRows();
       }
     }
 
@@ -359,42 +447,18 @@ export class CanvasRenderer {
       JSON.stringify(this.hoveredLinkRange) !== JSON.stringify(this.previousHoveredLinkRange);
 
     if (hyperlinkChanged) {
-      // Find rows containing the old or new hovered hyperlink
-      // Must check the correct buffer based on viewportY (scrollback vs screen)
       for (let y = 0; y < dims.rows; y++) {
-        let line: GhosttyCell[] | null = null;
-
-        // Same logic as rendering: fetch from scrollback or screen
-        if (viewportY > 0) {
-          if (y < viewportY && scrollbackProvider) {
-            // This row is from scrollback
-            // Floor viewportY for array access (handles fractional values during smooth scroll)
-            const scrollbackOffset = scrollbackLength - Math.floor(viewportY) + y;
-            line = scrollbackProvider.getScrollbackLine(scrollbackOffset);
-          } else {
-            // This row is from visible screen
-            const screenRow = y - Math.floor(viewportY);
-            line = buffer.getLine(screenRow);
-          }
-        } else {
-          // At bottom - fetch from visible screen
-          line = buffer.getLine(y);
-        }
-
-        if (line) {
-          for (const cell of line) {
-            if (
-              cell.hyperlink_id === this.hoveredHyperlinkId ||
-              cell.hyperlink_id === this.previousHoveredHyperlinkId
-            ) {
-              hyperlinkRows.add(y);
-              break; // Found hyperlink in this row
-            }
+        const line = visibleLines.get(y)!;
+        for (const cell of line) {
+          if (
+            cell.hyperlink_id === this.hoveredHyperlinkId ||
+            cell.hyperlink_id === this.previousHoveredHyperlinkId
+          ) {
+            hyperlinkRows.add(y);
+            break;
           }
         }
       }
-      // Update previous state
-      this.previousHoveredHyperlinkId = this.hoveredHyperlinkId;
     }
 
     // Track rows affected by link range changes (for regex URLs)
@@ -415,11 +479,7 @@ export class CanvasRenderer {
           hyperlinkRows.add(y);
         }
       }
-      this.previousHoveredLinkRange = this.hoveredLinkRange;
     }
-
-    // Track if anything was actually rendered
-    let anyLinesRendered = false;
 
     // Determine which rows need rendering.
     // We also include adjacent rows (above and below) for each dirty row to handle
@@ -441,41 +501,26 @@ export class CanvasRenderer {
       }
     }
 
-    // Render each line
+    if (!forceAll && (cursorMoved || this.cursorBlink)) {
+      rowsToRender.add(cursor.y);
+      if (cursorMoved) rowsToRender.add(this.lastCursorPosition.y);
+    }
+
+    if (forceAll) {
+      this.ctx.fillStyle = this.theme.background;
+      this.ctx.fillRect(
+        0,
+        0,
+        this.canvas.width / this.devicePixelRatio,
+        this.canvas.height / this.devicePixelRatio
+      );
+    }
+
     for (let y = 0; y < dims.rows; y++) {
       if (!rowsToRender.has(y)) {
         continue;
       }
-
-      anyLinesRendered = true;
-
-      // Fetch line from scrollback or visible screen
-      let line: GhosttyCell[] | null = null;
-      if (viewportY > 0) {
-        // Scrolled up - need to fetch from scrollback + visible screen
-        // When scrolled up N lines, we want to show:
-        // - Scrollback lines (from the end) + visible screen lines
-
-        // Check if this row should come from scrollback or visible screen
-        if (y < viewportY && scrollbackProvider) {
-          // This row is from scrollback (upper part of viewport)
-          // Get from end of scrollback buffer
-          // Floor viewportY for array access (handles fractional values during smooth scroll)
-          const scrollbackOffset = scrollbackLength - Math.floor(viewportY) + y;
-          line = scrollbackProvider.getScrollbackLine(scrollbackOffset);
-        } else {
-          // This row is from visible screen (lower part of viewport)
-          const screenRow = viewportY > 0 ? y - Math.floor(viewportY) : y;
-          line = buffer.getLine(screenRow);
-        }
-      } else {
-        // At bottom - fetch from visible screen
-        line = buffer.getLine(y);
-      }
-
-      if (line) {
-        this.renderLine(line, y, dims.cols);
-      }
+      this.renderLine(visibleLines.get(y)!, y, dims.cols);
     }
 
     // Selection highlighting is now integrated into renderCellBackground/renderCellText
@@ -495,11 +540,16 @@ export class CanvasRenderer {
 
     // Update last cursor position
     this.lastCursorPosition = { x: cursor.x, y: cursor.y };
+    this.lastViewportY = viewportY;
+    this.previousHoveredHyperlinkId = this.hoveredHyperlinkId;
+    this.previousHoveredLinkRange = this.hoveredLinkRange;
+    this.selectionManager?.clearDirtySelectionRows();
 
     // ALWAYS clear dirty flags after rendering, regardless of forceAll.
     // This is critical - if we don't clear after a full redraw, the dirty
     // state persists and the next frame might not detect new changes properly.
     buffer.clearDirty();
+    return true;
   }
 
   /**
@@ -640,7 +690,9 @@ export class CanvasRenderer {
 
     // Get the character to render - use grapheme lookup for complex scripts
     let char: string;
-    if (cell.grapheme_len > 0 && this.currentBuffer?.getGraphemeString) {
+    if (typeof cell.text === 'string') {
+      char = cell.text;
+    } else if (cell.grapheme_len > 0 && this.currentBuffer?.getGraphemeString) {
       // Cell has additional codepoints - get full grapheme cluster
       char = this.currentBuffer.getGraphemeString(y, x);
     } else {
@@ -767,7 +819,7 @@ export class CanvasRenderer {
     // xterm.js uses ~530ms blink interval
     this.cursorBlinkInterval = window.setInterval(() => {
       this.cursorVisible = !this.cursorVisible;
-      // Note: Render loop should redraw cursor line automatically
+      this.onCursorBlink?.();
     }, 530);
   }
 

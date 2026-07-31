@@ -569,6 +569,8 @@ export interface GhosttyCell {
   width: number; // u8 (character width: 1=normal, 2=wide, etc.)
   hyperlink_id: number; // u16 (0 = no link, >0 = hyperlink ID in set)
   grapheme_len: number; // u8 (number of extra codepoints beyond first)
+  /** Materialized grapheme text captured with the same render snapshot. */
+  text?: string;
 }
 
 /**

@@ -449,7 +449,7 @@ new file mode 100644
 index 000000000..73ae2e6fa
 --- /dev/null
 +++ b/src/terminal/c/terminal.zig
-@@ -0,0 +1,1139 @@
+@@ -0,0 +1,1111 @@
 +//! C API wrapper for Terminal
 +//!
 +//! This provides a minimal, high-performance interface to Ghostty's Terminal
@@ -1040,8 +1040,9 @@ index 000000000..73ae2e6fa
 +    @memset(wrapper.render_state.row_data.items(.dirty), false);
 +}
 +
-+/// Get ALL viewport cells in one call - reads directly from terminal screen buffer.
-+/// This bypasses the RenderState cache to ensure fresh data for all rows.
++/// Get ALL viewport cells from the official RenderState snapshot in one call.
++/// RenderState owns the viewport row mapping and copies managed cell data so
++/// page movement cannot invalidate the exported frame while it is being read.
 +/// Returns total cells written (rows * cols), or -1 on error.
 +pub fn renderStateGetViewport(
 +    ptr: ?*anyopaque,
@@ -1050,69 +1051,27 @@ index 000000000..73ae2e6fa
 +) callconv(.c) c_int {
 +    const wrapper: *const TerminalWrapper = @ptrCast(@alignCast(ptr orelse return -1));
 +    const rs = &wrapper.render_state;
-+    const t = &wrapper.terminal;
 +    const rows = rs.rows;
 +    const cols = rs.cols;
 +    const total: usize = @as(usize, rows) * cols;
 +
 +    if (buf_size < total) return -1;
-+
-+    // Read directly from terminal's active screen, bypassing RenderState cache.
-+    // This ensures we always get fresh data for ALL rows, not just dirty ones.
-+    const pages = &t.screens.active.pages;
++    if (rs.row_data.len != rows) return -1;
 +
 +    var idx: usize = 0;
 +    for (0..rows) |y| {
-+        // Get the row from the active viewport
-+        const pin = pages.pin(.{ .active = .{ .y = @intCast(y) } }) orelse {
-+            // Row doesn't exist, fill with defaults
-+            for (0..cols) |_| {
-+                out[idx] = .{
-+                    .codepoint = 0,
-+                    .fg_r = rs.colors.foreground.r,
-+                    .fg_g = rs.colors.foreground.g,
-+                    .fg_b = rs.colors.foreground.b,
-+                    .bg_r = rs.colors.background.r,
-+                    .bg_g = rs.colors.background.g,
-+                    .bg_b = rs.colors.background.b,
-+                    .flags = 0,
-+                    .width = 1,
-+                    .hyperlink_id = 0,
-+                };
-+                idx += 1;
-+            }
-+            continue;
-+        };
-+
-+        const cells = pin.cells(.all);
-+        const page = pin.node.data;
++        const cells = rs.row_data.items(.cells)[y].slice();
++        const raw_cells = cells.items(.raw);
++        const graphemes = cells.items(.grapheme);
++        const styles = cells.items(.style);
++        if (raw_cells.len != cols) return -1;
 +
 +        for (0..cols) |x| {
-+            if (x >= cells.len) {
-+                // Past end of row, fill with default
-+                out[idx] = .{
-+                    .codepoint = 0,
-+                    .fg_r = rs.colors.foreground.r,
-+                    .fg_g = rs.colors.foreground.g,
-+                    .fg_b = rs.colors.foreground.b,
-+                    .bg_r = rs.colors.background.r,
-+                    .bg_g = rs.colors.background.g,
-+                    .bg_b = rs.colors.background.b,
-+                    .flags = 0,
-+                    .width = 1,
-+                    .hyperlink_id = 0,
-+                };
-+                idx += 1;
-+                continue;
-+            }
-+
-+            const cell = &cells[x];
-+
-+            // Get style from page styles (cell has style_id)
-+            const sty: Style = if (cell.style_id > 0)
-+                page.styles.get(page.memory, cell.style_id).*
-+            else
-+                .{};
++            const cell = &raw_cells[x];
++            const sty: Style = switch (cell.content_tag) {
++                .bg_color_rgb, .bg_color_palette => styles[x],
++                else => if (cell.style_id > 0) styles[x] else .{},
++            };
 +
 +            // Resolve colors
 +            const fg: color.RGB = switch (sty.fg_color) {
@@ -1133,11 +1092,9 @@ index 000000000..73ae2e6fa
 +            if (sty.flags.blink) flags |= 1 << 6;
 +            if (sty.flags.faint) flags |= 1 << 7;
 +
-+            // Get grapheme length if cell has grapheme data
 +            const grapheme_len: u8 = if (cell.hasGrapheme())
-+                if (page.lookupGrapheme(cell)) |cps| @min(@as(u8, @intCast(cps.len)), 255) else 0
-+            else
-+                0;
++                @intCast(@min(graphemes[x].len, std.math.maxInt(u8)))
++            else 0;
 +
 +            out[idx] = .{
 +                .codepoint = cell.codepoint(),
@@ -1175,38 +1132,30 @@ index 000000000..73ae2e6fa
 +) callconv(.c) c_int {
 +    const wrapper: *const TerminalWrapper = @ptrCast(@alignCast(ptr orelse return -1));
 +    const rs = &wrapper.render_state;
-+    const t = &wrapper.terminal;
 +    const cols: usize = @intCast(rs.cols);
 +
 +    if (row < 0 or col < 0) return -1;
-+    if (@as(usize, @intCast(row)) >= rs.rows) return -1;
-+    if (@as(usize, @intCast(col)) >= cols) return -1;
++    const y: usize = @intCast(row);
++    const x: usize = @intCast(col);
++    if (y >= rs.rows or y >= rs.row_data.len) return -1;
++    if (x >= cols) return -1;
 +    if (buf_size < 1) return -1;
 +
-+    // Get the pin for this row from the terminal's active screen
-+    const pages = &t.screens.active.pages;
-+    const pin = pages.pin(.{ .active = .{ .y = @intCast(row) } }) orelse return -1;
-+
-+    const cells = pin.cells(.all);
-+    const page = pin.node.data;
-+    const x: usize = @intCast(col);
-+
-+    if (x >= cells.len) return -1;
-+
-+    const cell = &cells[x];
++    const cells = rs.row_data.items(.cells)[y].slice();
++    const raw_cells = cells.items(.raw);
++    if (x >= raw_cells.len) return -1;
++    const cell = &raw_cells[x];
 +
 +    // First codepoint is always from the cell
 +    out[0] = cell.codepoint();
 +    var count: usize = 1;
 +
-+    // Add extra codepoints from grapheme map if present
++    // Managed grapheme data was copied into RenderState during update().
 +    if (cell.hasGrapheme()) {
-+        if (page.lookupGrapheme(cell)) |cps| {
-+            for (cps) |cp| {
-+                if (count >= buf_size) break;
-+                out[count] = cp;
-+                count += 1;
-+            }
++        for (cells.items(.grapheme)[x]) |cp| {
++            if (count >= buf_size) break;
++            out[count] = cp;
++            count += 1;
 +        }
 +    }
 +
@@ -1588,6 +1537,29 @@ index 000000000..73ae2e6fa
 +    try std.testing.expectEqual(@as(u32, 'l'), cells[2].codepoint);
 +    try std.testing.expectEqual(@as(u32, 'l'), cells[3].codepoint);
 +    try std.testing.expectEqual(@as(u32, 'o'), cells[4].codepoint);
++}
++
++test "render state viewport export follows the official viewport snapshot" {
++    const term = new(8, 3);
++    defer free(term);
++
++    const payload = "TOP000\r\nMID001\r\nBOT002\r\nEND003";
++    write(term, payload, payload.len);
++
++    const wrapper: *TerminalWrapper = @ptrCast(@alignCast(term.?));
++    wrapper.terminal.screens.active.pages.scroll(.top);
++    _ = renderStateUpdate(term);
++
++    const row_cells = wrapper.render_state.row_data.items(.cells)[0].items(.raw);
++    try std.testing.expectEqual(@as(u32, 'T'), row_cells[0].codepoint());
++
++    const active_pin = wrapper.terminal.screens.active.pages.pin(.{ .active = .{} }).?;
++    try std.testing.expectEqual(@as(u32, 'M'), active_pin.cells(.all)[0].codepoint());
++
++    var cells: [8 * 3]GhosttyCell = undefined;
++    const count = renderStateGetViewport(term, &cells, cells.len);
++    try std.testing.expectEqual(@as(c_int, cells.len), count);
++    try std.testing.expectEqual(row_cells[0].codepoint(), cells[0].codepoint);
 +}
 diff --git a/src/terminal/Screen.zig b/src/terminal/Screen.zig
 index ba2af2473..b8be8f273 100644

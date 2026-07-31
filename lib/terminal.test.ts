@@ -3300,4 +3300,35 @@ describe('Scrollback Viewport Stability', () => {
       term.dispose();
     }
   });
+
+  test('failed frame materialization preserves render state and retries', async () => {
+    if (!container) return;
+
+    const term = await createIsolatedTerminal({ cols: 20, rows: 5 });
+    term.open(container);
+    const renderer = term.renderer!;
+    const originalRender = renderer.render;
+    let renderEvents = 0;
+    const subscription = term.onRender(() => {
+      renderEvents++;
+    });
+
+    try {
+      renderer.render = (() => false) as typeof renderer.render;
+      expect(term.renderNow(true)).toBe(false);
+      expect(renderEvents).toBe(0);
+      expect((term as any).renderFullNextFrame).toBe(true);
+      expect((term as any).renderRetryTimer).toBeDefined();
+
+      renderer.render = originalRender as typeof renderer.render;
+      expect(term.renderNow(true)).toBe(true);
+      expect(renderEvents).toBe(1);
+      expect((term as any).renderRetryTimer).toBeUndefined();
+      expect((term as any).renderRetryDelayMs).toBe(16);
+    } finally {
+      renderer.render = originalRender as typeof renderer.render;
+      subscription.dispose();
+      term.dispose();
+    }
+  });
 });

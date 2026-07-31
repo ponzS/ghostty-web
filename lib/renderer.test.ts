@@ -7,7 +7,76 @@
  */
 
 import { describe, expect, test } from 'bun:test';
-import { DEFAULT_THEME } from './renderer';
+import { CanvasRenderer, DEFAULT_THEME } from './renderer';
+import type { IRenderable, IScrollbackProvider } from './renderer';
+import type { GhosttyCell } from './types';
+
+function cell(codepoint: number = 32): GhosttyCell {
+  return {
+    codepoint,
+    fg_r: 204,
+    fg_g: 204,
+    fg_b: 204,
+    bg_r: 0,
+    bg_g: 0,
+    bg_b: 0,
+    flags: 0,
+    width: 1,
+    hyperlink_id: 0,
+    grapheme_len: 0,
+  };
+}
+
+function rendererHarness() {
+  const canvas = document.createElement('canvas');
+  const context = canvas.getContext('2d') as CanvasRenderingContext2D;
+  let drawCalls = 0;
+  context.fillRect = () => {
+    drawCalls++;
+  };
+  context.clearRect = () => {
+    drawCalls++;
+  };
+  context.fillText = () => {
+    drawCalls++;
+  };
+  canvas.getContext = (() => context) as typeof canvas.getContext;
+  return {
+    renderer: new CanvasRenderer(canvas, { devicePixelRatio: 1 }),
+    drawCalls: () => drawCalls,
+  };
+}
+
+function renderable(cols: number, rows: number) {
+  const viewport = Array.from({ length: cols * rows }, (_, index) => cell(65 + index));
+  let viewportReads = 0;
+  let lineReads = 0;
+  let cleanCalls = 0;
+  const buffer: IRenderable = {
+    getViewport: () => {
+      viewportReads++;
+      return viewport;
+    },
+    getLine: (row) => {
+      lineReads++;
+      const start = row * cols;
+      return viewport.slice(start, start + cols);
+    },
+    getCursor: () => ({ x: 0, y: 0, visible: false }),
+    getDimensions: () => ({ cols, rows }),
+    isRowDirty: () => true,
+    needsFullRedraw: () => true,
+    clearDirty: () => {
+      cleanCalls++;
+    },
+  };
+  return {
+    buffer,
+    viewportReads: () => viewportReads,
+    lineReads: () => lineReads,
+    cleanCalls: () => cleanCalls,
+  };
+}
 
 describe('CanvasRenderer', () => {
   describe('Default Theme', () => {
@@ -59,6 +128,51 @@ describe('CanvasRenderer', () => {
       expect(DEFAULT_THEME.foreground).toMatch(hexPattern);
       expect(DEFAULT_THEME.background).toMatch(hexPattern);
       expect(DEFAULT_THEME.cursor).toMatch(hexPattern);
+    });
+  });
+
+  describe('Atomic viewport materialization', () => {
+    test('exports the active viewport once per frame', () => {
+      const harness = rendererHarness();
+      const terminal = renderable(4, 3);
+
+      expect(harness.renderer.render(terminal.buffer, true)).toBe(true);
+      expect(terminal.viewportReads()).toBe(1);
+      expect(terminal.lineReads()).toBe(0);
+      expect(terminal.cleanCalls()).toBe(1);
+    });
+
+    test('keeps the previous canvas when any visible history row is unavailable', () => {
+      const harness = rendererHarness();
+      const terminal = renderable(2, 3);
+      expect(harness.renderer.render(terminal.buffer, true)).toBe(true);
+      const committedDrawCalls = harness.drawCalls();
+
+      const provider: IScrollbackProvider = {
+        getScrollbackLength: () => 3,
+        getScrollbackLine: (offset) => (offset === 1 ? null : [cell(72), cell(73)]),
+      };
+
+      expect(harness.renderer.render(terminal.buffer, true, 3, provider)).toBe(false);
+      expect(harness.drawCalls()).toBe(committedDrawCalls);
+      expect(terminal.cleanCalls()).toBe(1);
+    });
+
+    test('uses integer viewport rows for fractional scrollback mapping', () => {
+      const harness = rendererHarness();
+      const terminal = renderable(1, 2);
+      const offsets: number[] = [];
+      const provider: IScrollbackProvider = {
+        getScrollbackLength: () => 5,
+        getScrollbackLine: (offset) => {
+          offsets.push(offset);
+          return [cell(80 + offset)];
+        },
+      };
+
+      expect(harness.renderer.render(terminal.buffer, true, 1.5, provider)).toBe(true);
+      expect(offsets).toEqual([4]);
+      expect(offsets).not.toContain(5);
     });
   });
 });

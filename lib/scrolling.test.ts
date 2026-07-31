@@ -490,6 +490,22 @@ describe('Scrolling Methods', () => {
     // Should be clamped to 0 (bottom)
     expect((term as any).viewportY).toBe(0);
   });
+
+  test('render clamps stale viewport state to retained scrollback bounds', async () => {
+    for (let i = 0; i < 50; i++) {
+      term.write(`Line ${i}\r\n`);
+    }
+
+    const scrollbackLength = term.getScrollbackLength();
+    expect(scrollbackLength).toBeGreaterThan(0);
+
+    term.viewportY = scrollbackLength + 20;
+    (term as any).targetViewportY = scrollbackLength + 40;
+    (term as any).renderer.render(term.wasmTerm, true, term.viewportY, term, 1);
+
+    expect(term.viewportY).toBe(scrollbackLength);
+    expect((term as any).targetViewportY).toBe(scrollbackLength);
+  });
 });
 
 describe('Scroll Events', () => {
