@@ -34,6 +34,14 @@ git apply --check ../patches/ghostty-wasm-api.patch || {
     exit 1
 }
 git apply ../patches/ghostty-wasm-api.patch
+git apply --check ../patches/ghostty-scrollback-generation.patch || {
+    echo "❌ Scrollback generation patch doesn't apply cleanly"
+    git apply -R ../patches/ghostty-wasm-api.patch
+    rm -f include/ghostty/vt/terminal.h
+    rm -f src/terminal/c/terminal.zig
+    exit 1
+}
+git apply ../patches/ghostty-scrollback-generation.patch
 
 # Build WASM
 echo "⚙️  Building WASM (takes ~20 seconds)..."
@@ -46,6 +54,7 @@ cp ghostty/zig-out/bin/ghostty-vt.wasm ./
 # Revert patch to keep submodule clean
 echo "🧹 Cleaning up..."
 cd ghostty
+git apply -R ../patches/ghostty-scrollback-generation.patch
 git apply -R ../patches/ghostty-wasm-api.patch
 # Remove new files created by the patch
 rm -f include/ghostty/vt/terminal.h

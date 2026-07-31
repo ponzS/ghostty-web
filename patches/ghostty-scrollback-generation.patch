@@ -1,0 +1,120 @@
+diff --git a/src/terminal/PageList.zig b/src/terminal/PageList.zig
+--- a/src/terminal/PageList.zig
++++ b/src/terminal/PageList.zig
+@@ -2220,6 +2220,11 @@ fn scrollPrompt(self: *PageList, delta: isize) void {
+ /// Clear the screen by scrolling written contents up into the scrollback.
+ /// This will not update the viewport.
+ pub fn scrollClear(self: *PageList) !void {
++    _ = try self.scrollClearCount();
++}
++
++/// Clear the screen and return the number of rows moved into scrollback.
++pub fn scrollClearCount(self: *PageList) !usize {
+     defer self.assertIntegrity();
+ 
+     // Go through the active area backwards to find the first non-empty
+@@ -2248,6 +2253,7 @@ pub fn scrollClear(self: *PageList) !void {
+ 
+     // Scroll
+     for (0..non_empty) |_| _ = try self.grow();
++    return non_empty;
+ }
+ 
+ /// This represents the state necessary to render a scrollbar for this
+diff --git a/src/terminal/Screen.zig b/src/terminal/Screen.zig
+--- a/src/terminal/Screen.zig
++++ b/src/terminal/Screen.zig
+@@ -75,6 +75,10 @@ else
+ /// Dirty flags for the renderer.
+ dirty: Dirty = .{},
+ 
++/// Rows moved from the active area into scrollback. This wraps so embedders
++/// can compare generations without depending on retained history length.
++scrollback_generation: u32 = 0,
++
+ /// See Terminal.Dirty. This behaves the same way.
+ pub const Dirty = packed struct {
+     /// Set when the selection is set or unset, regardless of if the
+@@ -529,6 +533,7 @@ pub fn clonePool(
+         .cursor = cursor,
+         .selection = sel,
+         .dirty = self.dirty,
++        .scrollback_generation = self.scrollback_generation,
+     };
+     result.assertIntegrity();
+     return result;
+@@ -816,6 +821,7 @@ pub fn cursorDownScroll(self: *Screen) !void {
+         // Grow our pages by one row. The PageList will handle if we need to
+         // allocate, prune scrollback, whatever.
+         _ = try self.pages.grow();
++        self.scrollback_generation +%= 1;
+ 
+         // If our pin page change it means that the page that the pin
+         // was on was pruned. In this case, grow() moves the pin to
+@@ -900,7 +906,9 @@ pub fn cursorScrollAbove(self: *Screen) !void {
+     //  lot cheaper in 99% of cases.
+ 
+     const old_pin = self.cursor.page_pin.*;
+-    if (try self.pages.grow()) |_| {
++    const grew_page = try self.pages.grow();
++    if (!self.no_scrollback) self.scrollback_generation +%= 1;
++    if (grew_page) |_| {
+         try self.cursorScrollAboveRotate();
+     } else {
+         // In this case, it means grow() didn't allocate a new page.
+@@ -1250,7 +1258,8 @@ pub inline fn scrollClear(self: *Screen) !void {
+ pub inline fn scrollClear(self: *Screen) !void {
+     defer self.assertIntegrity();
+ 
+-    try self.pages.scrollClear();
++    const added = try self.pages.scrollClearCount();
++    if (!self.no_scrollback) self.scrollback_generation +%= @intCast(added);
+     self.cursorReload();
+ 
+     if (comptime build_options.kitty_graphics) {
+@@ -4055,6 +4064,7 @@ test "Screen: scrolling" {
+ 
+     // Scroll down, should still be bottom
+     try s.cursorDownScroll();
++    try testing.expectEqual(@as(u32, 0), s.scrollback_generation);
+     {
+         const contents = try s.dumpStringAlloc(alloc, .{ .viewport = .{} });
+         defer alloc.free(contents);
+@@ -4324,7 +4334,9 @@ test "Screen: scrollback doesn't move viewport if not at bottom" {
+ 
+     // Next, we scroll back down by 1, this grows the scrollback but we
+     // shouldn't move.
++    const generation_before_scroll = s.scrollback_generation;
+     try s.cursorDownScroll();
++    try testing.expectEqual(generation_before_scroll +% 1, s.scrollback_generation);
+     {
+         const contents = try s.dumpStringAlloc(alloc, .{ .viewport = .{} });
+         defer alloc.free(contents);
+@@ -4333,6 +4345,7 @@ test "Screen: scrollback doesn't move viewport if not at bottom" {
+     // Scroll again, this clears scrollback so we should move viewports
+     // but still see the same thing since our original view fits.
+     try s.cursorDownScroll();
++    try testing.expectEqual(generation_before_scroll +% 2, s.scrollback_generation);
+     {
+         const contents = try s.dumpStringAlloc(alloc, .{ .viewport = .{} });
+         defer alloc.free(contents);
+@@ -4486,7 +4499,9 @@ test "Screen: scroll and clear full screen" {
+         try testing.expectEqualStrings("1ABCD\n2EFGH\n3IJKL", contents);
+     }
+ 
++    const generation_before_clear = s.scrollback_generation;
+     try s.scrollClear();
++    try testing.expectEqual(generation_before_clear +% 3, s.scrollback_generation);
+     {
+         const contents = try s.dumpStringAlloc(alloc, .{ .viewport = .{} });
+         defer alloc.free(contents);
+@@ -4609,7 +4624,9 @@ test "Screen: scroll above same page" {
+     //   +----------+ :
+     //  +-------------+
+ 
++    const generation_before_scroll = s.scrollback_generation;
+     try s.cursorScrollAbove();
++    try testing.expectEqual(generation_before_scroll +% 1, s.scrollback_generation);
+ 
+     //   +----------+ = PAGE 0
+     // 0 |1ABCD00000|

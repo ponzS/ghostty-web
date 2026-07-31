@@ -446,6 +446,7 @@ export interface GhosttyWasmExports extends WebAssembly.Exports {
 
   // Scrollback API
   ghostty_terminal_get_scrollback_length(terminal: TerminalHandle): number;
+  ghostty_terminal_get_scrollback_generation(terminal: TerminalHandle): number;
   ghostty_terminal_get_scrollback_line(
     terminal: TerminalHandle,
     offset: number,

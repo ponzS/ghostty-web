@@ -32,7 +32,7 @@ new file mode 100644
 index 000000000..c467102c3
 --- /dev/null
 +++ b/include/ghostty/vt/terminal.h
-@@ -0,0 +1,287 @@
+@@ -0,0 +1,290 @@
 +/**
 + * @file terminal.h
 + *
@@ -224,6 +224,9 @@ index 000000000..c467102c3
 +/** Get number of scrollback lines (history, not including active screen) */
 +int ghostty_terminal_get_scrollback_length(GhosttyTerminal term);
 +
++/** Get a wrapping generation incremented whenever a row enters history. */
++uint32_t ghostty_terminal_get_scrollback_generation(GhosttyTerminal term);
++
 +/**
 + * Get a line from the scrollback buffer.
 + * @param offset 0 = oldest line, (length-1) = most recent scrollback line
@@ -324,7 +327,7 @@ diff --git a/src/lib_vt.zig b/src/lib_vt.zig
 index 03a883e20..1336676d7 100644
 --- a/src/lib_vt.zig
 +++ b/src/lib_vt.zig
-@@ -140,6 +140,46 @@ comptime {
+@@ -140,6 +140,47 @@ comptime {
          @export(&c.sgr_unknown_partial, .{ .name = "ghostty_sgr_unknown_partial" });
          @export(&c.sgr_attribute_tag, .{ .name = "ghostty_sgr_attribute_tag" });
          @export(&c.sgr_attribute_value, .{ .name = "ghostty_sgr_attribute_value" });
@@ -357,6 +360,7 @@ index 03a883e20..1336676d7 100644
 +
 +        // Scrollback API
 +        @export(&c.terminal_get_scrollback_length, .{ .name = "ghostty_terminal_get_scrollback_length" });
++        @export(&c.terminal_get_scrollback_generation, .{ .name = "ghostty_terminal_get_scrollback_generation" });
 +        @export(&c.terminal_get_scrollback_line, .{ .name = "ghostty_terminal_get_scrollback_line" });
 +        @export(&c.terminal_get_scrollback_grapheme, .{ .name = "ghostty_terminal_get_scrollback_grapheme" });
 +        @export(&c.terminal_is_row_wrapped, .{ .name = "ghostty_terminal_is_row_wrapped" });
@@ -383,7 +387,7 @@ index bc92597f5..d0ee49c1b 100644
  
  // The full C API, unexported.
  pub const osc_new = osc.new;
-@@ -52,6 +53,47 @@ pub const key_encoder_encode = key_encode.encode;
+@@ -52,6 +53,48 @@ pub const key_encoder_encode = key_encode.encode;
  
  pub const paste_is_safe = paste.is_safe;
  
@@ -416,6 +420,7 @@ index bc92597f5..d0ee49c1b 100644
 +
 +// Scrollback API
 +pub const terminal_get_scrollback_length = terminal.getScrollbackLength;
++pub const terminal_get_scrollback_generation = terminal.getScrollbackGeneration;
 +pub const terminal_get_scrollback_line = terminal.getScrollbackLine;
 +pub const terminal_get_scrollback_grapheme = terminal.getScrollbackGrapheme;
 +pub const terminal_is_row_wrapped = terminal.isRowWrapped;
@@ -444,7 +449,7 @@ new file mode 100644
 index 000000000..73ae2e6fa
 --- /dev/null
 +++ b/src/terminal/c/terminal.zig
-@@ -0,0 +1,1132 @@
+@@ -0,0 +1,1139 @@
 +//! C API wrapper for Terminal
 +//!
 +//! This provides a minimal, high-performance interface to Ghostty's Terminal
@@ -1244,6 +1249,13 @@ index 000000000..73ae2e6fa
 +    // We subtract rows (active area) to get just scrollback
 +    if (pages.total_rows <= pages.rows) return 0;
 +    return @intCast(pages.total_rows - pages.rows);
++}
++
++/// Get a wrapping generation that increments whenever a row enters history.
++pub fn getScrollbackGeneration(ptr: ?*anyopaque) callconv(.c) u32 {
++    const wrapper: *const TerminalWrapper = @ptrCast(@alignCast(ptr orelse return 0));
++    const primary = wrapper.terminal.screens.get(.primary) orelse return 0;
++    return primary.scrollback_generation;
 +}
 +
 +/// Get a line from the scrollback buffer

@@ -3201,3 +3201,103 @@ describe('Synchronous open()', () => {
     term.dispose();
   });
 });
+
+describe('Scrollback Viewport Stability', () => {
+  let container: HTMLElement | null = null;
+
+  beforeEach(() => {
+    if (typeof document !== 'undefined') {
+      container = document.createElement('div');
+      document.body.appendChild(container);
+    }
+  });
+
+  afterEach(() => {
+    container?.remove();
+    container = null;
+  });
+
+  test('new output preserves nearby history when the retained scrollback window is capped', async () => {
+    if (!container) return;
+
+    const term = await createIsolatedTerminal({ cols: 40, rows: 5, scrollback: 100 });
+    term.open(container);
+
+    try {
+      const viewportLine = () => {
+        const scrollbackLength = term.getScrollbackLength();
+        const offset = scrollbackLength - Math.floor(term.viewportY);
+        const cells = term.wasmTerm!.getScrollbackLine(offset);
+        return cells
+          ?.map((cell) => String.fromCodePoint(cell.codepoint || 32))
+          .join('')
+          .trimEnd();
+      };
+
+      let previousScrollbackLength = 0;
+      let nextLine = 0;
+      let observedInitialPrune = false;
+      for (; nextLine < 4000; nextLine++) {
+        term.write(`Line ${nextLine}\r\n`);
+        const scrollbackLength = term.getScrollbackLength();
+        if (scrollbackLength <= previousScrollbackLength && previousScrollbackLength > 0) {
+          observedInitialPrune = true;
+          nextLine++;
+          break;
+        }
+        previousScrollbackLength = scrollbackLength;
+      }
+      expect(observedInitialPrune).toBe(true);
+
+      for (let i = 0; i < 500; i++, nextLine++) {
+        term.write(`Line ${nextLine}\r\n`);
+      }
+      term.scrollToLine(2);
+      const expectedViewportLine = viewportLine();
+      previousScrollbackLength = term.getScrollbackLength();
+      let observedNextPrune = false;
+
+      for (; nextLine < 8000; nextLine++) {
+        term.write(`Line ${nextLine}\r\n`);
+        const scrollbackLength = term.getScrollbackLength();
+        if (scrollbackLength <= previousScrollbackLength) {
+          observedNextPrune = true;
+          expect(viewportLine()).toBe(expectedViewportLine);
+          break;
+        }
+        previousScrollbackLength = scrollbackLength;
+      }
+
+      expect(observedNextPrune).toBe(true);
+    } finally {
+      term.dispose();
+    }
+  });
+
+  test('active-screen line edits do not move a history viewport', async () => {
+    if (!container) return;
+
+    const term = await createIsolatedTerminal({ cols: 40, rows: 5, scrollback: 100 });
+    term.open(container);
+
+    try {
+      for (let i = 0; i < 20; i++) {
+        term.write(`Line ${i}\r\n`);
+      }
+      term.scrollToLine(4);
+
+      const viewportY = term.viewportY;
+      const generation = term.wasmTerm!.getScrollbackGeneration();
+      (term as any).renderFullNextFrame = false;
+
+      term.write('\x1b[H\x1b[M');
+
+      expect(term.wasmTerm!.getScrollbackGeneration()).toBe(generation);
+      expect(term.viewportY).toBe(viewportY);
+      expect((term as any).targetViewportY).toBe(viewportY);
+      expect((term as any).renderFullNextFrame).toBe(true);
+    } finally {
+      term.dispose();
+    }
+  });
+});
