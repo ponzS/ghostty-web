@@ -45,6 +45,11 @@ export class Ghostty {
 
   constructor(wasmInstance: WebAssembly.Instance) {
     this.exports = wasmInstance.exports as GhosttyWasmExports;
+    if (typeof this.exports.ghostty_terminal_get_scrollback_generation !== 'function') {
+      throw new Error(
+        'Incompatible Ghostty WASM: missing ghostty_terminal_get_scrollback_generation; reload after updating cached frontend assets'
+      );
+    }
     this.memory = this.exports.memory;
   }
 
@@ -587,6 +592,11 @@ export class GhosttyTerminal {
   /** Get number of scrollback lines (history, not including active screen) */
   getScrollbackLength(): number {
     return Math.min(this.getRawScrollbackLength(), this.logicalScrollbackLimit);
+  }
+
+  /** Get the wrapping generation for rows appended to normal-screen history. */
+  getScrollbackGeneration(): number {
+    return this.exports.ghostty_terminal_get_scrollback_generation(this.handle) >>> 0;
   }
 
   /**
