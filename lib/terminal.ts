@@ -17,6 +17,7 @@
 
 import { BufferNamespace } from './buffer';
 import { EventEmitter } from './event-emitter';
+import type { ISemanticCheckpointAdapter } from './interfaces';
 import type { Ghostty, GhosttyCell, GhosttyTerminal, GhosttyTerminalConfig } from './ghostty';
 import { getGhostty } from './index';
 import { InputHandler, type MouseTrackingConfig } from './input-handler';
@@ -37,6 +38,25 @@ import { UrlRegexProvider } from './providers/url-regex-provider';
 import { CanvasRenderer } from './renderer';
 import { SelectionManager } from './selection-manager';
 import type { ILink, ILinkProvider } from './types';
+
+export type RenderReason =
+  | 'output'
+  | 'replay'
+  | 'resize'
+  | 'selection'
+  | 'cursor'
+  | 'explicit';
+
+export interface TerminalRenderDiagnostics {
+  renderRequestCount: number;
+  scheduledFrameCount: number;
+  renderAttemptCount: number;
+  renderFrameCount: number;
+  fullRenderCount: number;
+  partialRenderCount: number;
+  pendingReasons: RenderReason[];
+  lastRenderReasons: RenderReason[];
+}
 
 // ============================================================================
 // Terminal Class
@@ -102,6 +122,16 @@ export class Terminal implements ITerminalCore {
   private isDisposed = false;
   private animationFrameId?: number;
   private renderFullNextFrame = false;
+  private pendingRenderReasons = new Set<RenderReason>();
+  private lastRenderReasons: RenderReason[] = [];
+  private renderDiagnostics = {
+    renderRequestCount: 0,
+    scheduledFrameCount: 0,
+    renderAttemptCount: 0,
+    renderFrameCount: 0,
+    fullRenderCount: 0,
+    partialRenderCount: 0,
+  };
   private renderRetryTimer?: number;
   private renderRetryDelayMs = 16;
   private writeQueue: Uint8Array[] = [];
@@ -586,7 +616,7 @@ export class Terminal implements ITerminalCore {
     // Invalidate link cache (content changed)
     this.linkDetector?.invalidateCache();
 
-    this.requestRender({ full: true });
+    this.requestRender({ full: true, reason: 'output' });
 
     if (wasAtBottom) {
       this.scrollToBottom();
@@ -731,7 +761,7 @@ export class Terminal implements ITerminalCore {
       // Fire resize event
       this.resizeEmitter.fire({ cols, rows });
 
-      this.requestRender({ full: true });
+      this.requestRender({ full: true, reason: 'resize' });
     } catch (e) {
       console.error('Terminal resize failed:', e);
     }
@@ -747,7 +777,7 @@ export class Terminal implements ITerminalCore {
     this.assertOpen();
     // Send ANSI clear screen and cursor home sequences
     this.wasmTerm!.write('\x1b[2J\x1b[H');
-    this.requestRender({ full: true });
+    this.requestRender({ full: true, reason: 'explicit' });
   }
 
   /**
@@ -768,7 +798,7 @@ export class Terminal implements ITerminalCore {
 
     // Reset title
     this.currentTitle = '';
-    this.requestRender({ full: true });
+    this.requestRender({ full: true, reason: 'explicit' });
   }
 
   /**
@@ -1159,6 +1189,8 @@ export class Terminal implements ITerminalCore {
     // Stop render loop and clear write queue
     this.cancelRenderLoop();
     this.writeQueue.length = 0;
+    this.pendingRenderReasons.clear();
+    this.lastRenderReasons = [];
 
     // Stop smooth scroll animation
     if (this.scrollAnimationFrame) {
@@ -1223,9 +1255,11 @@ export class Terminal implements ITerminalCore {
   }
 
   /** Schedule one coalesced render frame. */
-  public requestRender(options: { full?: boolean } = {}): void {
+  public requestRender(options: { full?: boolean; reason?: RenderReason } = {}): void {
     if (this.isDisposed || !this.isOpen) return;
 
+    this.renderDiagnostics.renderRequestCount++;
+    this.pendingRenderReasons.add(options.reason ?? 'explicit');
     if (this.renderRetryTimer !== undefined) {
       window.clearTimeout(this.renderRetryTimer);
       this.renderRetryTimer = undefined;
@@ -1233,18 +1267,32 @@ export class Terminal implements ITerminalCore {
     this.renderFullNextFrame = this.renderFullNextFrame || options.full === true;
     if (this.animationFrameId !== undefined) return;
 
+    this.renderDiagnostics.scheduledFrameCount++;
     this.animationFrameId = requestAnimationFrame(() => {
       const fullRender = this.renderFullNextFrame;
+      const reasons = [...this.pendingRenderReasons];
       this.animationFrameId = undefined;
       this.renderFullNextFrame = false;
+      this.pendingRenderReasons.clear();
+      this.lastRenderReasons = reasons;
       this.renderNow(fullRender);
     });
+  }
+
+  /** Return a copy of render scheduling counters and the latest merged reasons. */
+  public getRenderDiagnostics(): TerminalRenderDiagnostics {
+    return {
+      ...this.renderDiagnostics,
+      pendingReasons: [...this.pendingRenderReasons],
+      lastRenderReasons: [...this.lastRenderReasons],
+    };
   }
 
   /** Render immediately. A failed materialization keeps the last canvas and retries. */
   public renderNow(forceAll: boolean = false): boolean {
     if (this.isDisposed || !this.isOpen || !this.renderer || !this.wasmTerm) return false;
 
+    this.renderDiagnostics.renderAttemptCount++;
     const rendered = this.renderer.render(
       this.wasmTerm,
       forceAll,
@@ -1254,8 +1302,16 @@ export class Terminal implements ITerminalCore {
     );
     if (!rendered) {
       this.renderFullNextFrame = true;
+      this.pendingRenderReasons.add('explicit');
       this.scheduleRenderRetry();
       return false;
+    }
+
+    this.renderDiagnostics.renderFrameCount++;
+    if (forceAll) {
+      this.renderDiagnostics.fullRenderCount++;
+    } else {
+      this.renderDiagnostics.partialRenderCount++;
     }
 
     if (this.renderRetryTimer !== undefined) {
@@ -1285,7 +1341,7 @@ export class Terminal implements ITerminalCore {
     this.renderRetryDelayMs = Math.min(250, delay * 2);
     this.renderRetryTimer = window.setTimeout(() => {
       this.renderRetryTimer = undefined;
-      this.requestRender({ full: true });
+      this.requestRender({ full: true, reason: 'explicit' });
     }, delay);
   }
 
@@ -1293,6 +1349,11 @@ export class Terminal implements ITerminalCore {
    * Get a line from native WASM scrollback buffer
    * Implements IScrollbackProvider
    */
+  /** Semantic checkpoint support is opt-in and requires a complete WASM adapter. */
+  public getSemanticCheckpointAdapter(): ISemanticCheckpointAdapter | null {
+    return null;
+  }
+
   public getScrollbackLine(offset: number): GhosttyCell[] | null {
     if (!this.wasmTerm) return null;
     return this.wasmTerm.getScrollbackLine(offset);

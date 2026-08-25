@@ -169,6 +169,11 @@ describe('Terminal', () => {
       expect(term.rows).toBe(25);
     });
 
+    test('does not advertise an incomplete semantic checkpoint adapter', async () => {
+      const term = await createIsolatedTerminal();
+      expect(term.getSemanticCheckpointAdapter()).toBeNull();
+      term.dispose();
+    });
     test('exposes element after open', async () => {
       const term = await createIsolatedTerminal();
       expect(term.element).toBeUndefined();
@@ -3328,6 +3333,36 @@ describe('Scrollback Viewport Stability', () => {
     } finally {
       renderer.render = originalRender as typeof renderer.render;
       subscription.dispose();
+      term.dispose();
+    }
+  });
+
+  test('coalesces render requests and records merged reasons', async () => {
+    if (!container) return;
+
+    const term = await createIsolatedTerminal({ cols: 20, rows: 5 });
+    term.open(container);
+
+    try {
+      const before = term.getRenderDiagnostics();
+      term.requestRender({ reason: 'selection' });
+      term.requestRender({ full: true, reason: 'resize' });
+      term.requestRender({ reason: 'output' });
+
+      const pending = term.getRenderDiagnostics();
+      expect(pending.renderRequestCount).toBe(before.renderRequestCount + 3);
+      expect(pending.scheduledFrameCount).toBe(before.scheduledFrameCount + 1);
+      expect(pending.pendingReasons).toEqual(['selection', 'resize', 'output']);
+
+      await new Promise((resolve) => setTimeout(resolve, 50));
+
+      const after = term.getRenderDiagnostics();
+      expect(after.scheduledFrameCount).toBe(before.scheduledFrameCount + 1);
+      expect(after.renderFrameCount).toBeGreaterThanOrEqual(before.renderFrameCount + 1);
+      expect(after.fullRenderCount).toBeGreaterThanOrEqual(before.fullRenderCount + 1);
+      expect(after.lastRenderReasons).toEqual(['selection', 'resize', 'output']);
+      expect(after.pendingReasons).toEqual([]);
+    } finally {
       term.dispose();
     }
   });
