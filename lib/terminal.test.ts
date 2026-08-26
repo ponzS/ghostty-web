@@ -3337,6 +3337,38 @@ describe('Scrollback Viewport Stability', () => {
     }
   });
 
+  test('suppresses all renderer work across a presentation transaction', async () => {
+    if (!container) return;
+
+    const term = await createIsolatedTerminal({ cols: 20, rows: 5 });
+    term.open(container);
+    const renderer = term.renderer!;
+    const originalRender = renderer.render;
+    let renderCalls = 0;
+    renderer.render = ((...args: Parameters<typeof renderer.render>) => {
+      renderCalls++;
+      return originalRender.apply(renderer, args);
+    }) as typeof renderer.render;
+
+    try {
+      term.beginRenderSuppression();
+      term.beginRenderSuppression();
+      term.write('hidden replay');
+      expect(term.renderNow(true)).toBe(false);
+      expect(renderCalls).toBe(0);
+
+      term.endRenderSuppression();
+      expect(term.renderNow(true)).toBe(false);
+      expect(renderCalls).toBe(0);
+
+      term.endRenderSuppression({ render: false });
+      expect(term.renderNow(true)).toBe(true);
+      expect(renderCalls).toBe(1);
+    } finally {
+      renderer.render = originalRender as typeof renderer.render;
+      term.dispose();
+    }
+  });
   test('coalesces render requests and records merged reasons', async () => {
     if (!container) return;
 

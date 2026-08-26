@@ -121,6 +121,7 @@ export class Terminal implements ITerminalCore {
   private isOpen = false;
   private isDisposed = false;
   private animationFrameId?: number;
+  private renderSuppressionDepth = 0;
   private renderFullNextFrame = false;
   private pendingRenderReasons = new Set<RenderReason>();
   private lastRenderReasons: RenderReason[] = [];
@@ -582,8 +583,34 @@ export class Terminal implements ITerminalCore {
   }
 
   /**
-   * Internal write implementation (extracted from write())
+   * Parse replay bytes without presenting intermediate frames.
+   *
+   * Writes remain synchronous; only renderer work is deferred until the
+   * surrounding presentation transaction releases suppression.
    */
+  public writeReplay(data: string | Uint8Array): void {
+    this.beginRenderSuppression();
+    try {
+      this.write(data);
+    } finally {
+      this.endRenderSuppression({ render: false });
+    }
+  }
+
+  /** Defer all renderer work while preserving pending render state. */
+  public beginRenderSuppression(): void {
+    this.renderSuppressionDepth += 1;
+  }
+
+  /** Release one suppression scope and optionally schedule the final frame. */
+  public endRenderSuppression({ render = true, full = true }: { render?: boolean; full?: boolean } = {}): void {
+    this.renderSuppressionDepth = Math.max(0, this.renderSuppressionDepth - 1);
+    if (this.renderSuppressionDepth === 0 && render && this.isOpen && !this.isDisposed) {
+      this.requestRender({ full, reason: 'explicit' });
+    }
+  }
+
+  /** Internal write implementation (extracted from write()) */
   private writeInternal(data: string | Uint8Array, callback?: () => void): void {
     // Note: We intentionally do NOT clear selection on write - most modern terminals
     // preserve selection when new data arrives. Selection is cleared by user actions
@@ -793,8 +820,11 @@ export class Terminal implements ITerminalCore {
     const config = this.buildWasmConfig();
     this.wasmTerm = this.ghostty!.createTerminal(this.cols, this.rows, config);
 
-    // Clear renderer
-    this.renderer!.clear();
+    // Clear renderer only outside a presentation transaction. During replay,
+    // the caller keeps the last frame visible until the final full render.
+    if (this.renderSuppressionDepth === 0) {
+      this.renderer!.clear();
+    }
 
     // Reset title
     this.currentTitle = '';
@@ -1272,6 +1302,13 @@ export class Terminal implements ITerminalCore {
       const fullRender = this.renderFullNextFrame;
       const reasons = [...this.pendingRenderReasons];
       this.animationFrameId = undefined;
+      if (this.renderSuppressionDepth > 0) {
+        this.renderFullNextFrame = this.renderFullNextFrame || fullRender;
+        for (const reason of reasons) {
+          this.pendingRenderReasons.add(reason);
+        }
+        return;
+      }
       this.renderFullNextFrame = false;
       this.pendingRenderReasons.clear();
       this.lastRenderReasons = reasons;
@@ -1291,6 +1328,11 @@ export class Terminal implements ITerminalCore {
   /** Render immediately. A failed materialization keeps the last canvas and retries. */
   public renderNow(forceAll: boolean = false): boolean {
     if (this.isDisposed || !this.isOpen || !this.renderer || !this.wasmTerm) return false;
+    if (this.renderSuppressionDepth > 0) {
+      this.renderFullNextFrame = this.renderFullNextFrame || forceAll;
+      this.pendingRenderReasons.add(forceAll ? 'explicit' : 'output');
+      return false;
+    }
 
     this.renderDiagnostics.renderAttemptCount++;
     const rendered = this.renderer.render(
