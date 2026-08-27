@@ -131,6 +131,18 @@ describe('CanvasRenderer', () => {
     });
   });
 
+  describe('Scrollbar hover sizing', () => {
+    test('expands from the compact width while keeping the right edge fixed', () => {
+      const harness = rendererHarness();
+
+      expect(harness.renderer.getScrollbarWidth()).toBe(3);
+      harness.renderer.setScrollbarHoverProgress(0.5);
+      expect(harness.renderer.getScrollbarWidth()).toBe(5.5);
+      harness.renderer.setScrollbarHoverProgress(1);
+      expect(harness.renderer.getScrollbarWidth()).toBe(8);
+    });
+  });
+
   describe('Atomic viewport materialization', () => {
     test('exports the active viewport once per frame', () => {
       const harness = rendererHarness();
