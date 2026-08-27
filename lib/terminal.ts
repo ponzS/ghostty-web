@@ -35,17 +35,16 @@ import type {
 import { LinkDetector } from './link-detector';
 import { OSC8LinkProvider } from './providers/osc8-link-provider';
 import { UrlRegexProvider } from './providers/url-regex-provider';
-import { CanvasRenderer } from './renderer';
+import {
+  SCROLLBAR_BASE_WIDTH,
+  SCROLLBAR_EXPANDED_WIDTH,
+  SCROLLBAR_RIGHT_INSET,
+  CanvasRenderer,
+} from './renderer';
 import { SelectionManager } from './selection-manager';
 import type { ILink, ILinkProvider } from './types';
 
-export type RenderReason =
-  | 'output'
-  | 'replay'
-  | 'resize'
-  | 'selection'
-  | 'cursor'
-  | 'explicit';
+export type RenderReason = 'output' | 'replay' | 'resize' | 'selection' | 'cursor' | 'explicit';
 
 export interface TerminalRenderDiagnostics {
   renderRequestCount: number;
@@ -165,6 +164,10 @@ export class Terminal implements ITerminalCore {
   private scrollbarVisible: boolean = false;
   private scrollbarOpacity: number = 0;
   private scrollbarHideTimeout?: number;
+  private scrollbarHoverAnimationFrame?: number;
+  private scrollbarHoverActive = false;
+  private readonly SCROLLBAR_HOVER_SENSOR_SIZE = 24;
+  private readonly SCROLLBAR_HOVER_ANIMATION_MS = 160;
   private readonly SCROLLBAR_HIDE_DELAY_MS = 1500; // Hide after 1.5 seconds
   private readonly SCROLLBAR_FADE_DURATION_MS = 200; // 200ms fade animation
 
@@ -603,7 +606,10 @@ export class Terminal implements ITerminalCore {
   }
 
   /** Release one suppression scope and optionally schedule the final frame. */
-  public endRenderSuppression({ render = true, full = true }: { render?: boolean; full?: boolean } = {}): void {
+  public endRenderSuppression({
+    render = true,
+    full = true,
+  }: { render?: boolean; full?: boolean } = {}): void {
     this.renderSuppressionDepth = Math.max(0, this.renderSuppressionDepth - 1);
     if (this.renderSuppressionDepth === 0 && render && this.isOpen && !this.isDisposed) {
       this.requestRender({ full, reason: 'explicit' });
@@ -1465,6 +1471,10 @@ export class Terminal implements ITerminalCore {
     }
 
     // Clean up scrollbar timers
+    if (this.scrollbarHoverAnimationFrame) {
+      cancelAnimationFrame(this.scrollbarHoverAnimationFrame);
+      this.scrollbarHoverAnimationFrame = undefined;
+    }
     if (this.scrollbarHideTimeout) {
       window.clearTimeout(this.scrollbarHideTimeout);
       this.scrollbarHideTimeout = undefined;
@@ -1512,6 +1522,8 @@ export class Terminal implements ITerminalCore {
       this.processScrollbarDrag(e);
       return;
     }
+
+    this.updateScrollbarHover(e.clientX);
 
     if (!this.linkDetector) return;
 
@@ -1673,6 +1685,8 @@ export class Terminal implements ITerminalCore {
    * Handle mouse leave to clear link hover
    */
   private handleMouseLeave = (): void => {
+    this.updateScrollbarHover(null);
+
     // Clear hyperlink underline
     if (this.renderer && this.wasmTerm) {
       const previousHyperlinkId = (this.renderer as any).hoveredHyperlinkId || 0;
@@ -1828,12 +1842,13 @@ export class Terminal implements ITerminalCore {
     // Use rect dimensions which are already in CSS pixels
     const canvasWidth = rect.width;
     const canvasHeight = rect.height;
-    const scrollbarWidth = 8;
-    const scrollbarX = canvasWidth - scrollbarWidth - 4;
+    const scrollbarWidth = SCROLLBAR_EXPANDED_WIDTH;
+    const scrollbarX = canvasWidth - scrollbarWidth - SCROLLBAR_RIGHT_INSET;
     const scrollbarPadding = 4;
 
-    // Check if click is in scrollbar area
-    if (mouseX >= scrollbarX && mouseX <= scrollbarX + scrollbarWidth) {
+    // Check the expanded hit area so a quick click near the right edge can grab it.
+    if (mouseX >= scrollbarX && mouseX <= canvasWidth - SCROLLBAR_RIGHT_INSET) {
+      this.updateScrollbarHover(e.clientX);
       // Prevent default and stop propagation to prevent text selection
       e.preventDefault();
       e.stopPropagation();
@@ -1924,6 +1939,50 @@ export class Terminal implements ITerminalCore {
     this.scrollToLine(Math.max(0, Math.min(scrollbackLength, newViewportY)));
   }
 
+  private updateScrollbarHover(clientX: number | null): void {
+    if (
+      !this.canvas ||
+      !this.renderer ||
+      !this.wasmTerm ||
+      this.wasmTerm.getScrollbackLength() === 0
+    ) {
+      clientX = null;
+    }
+
+    const rect = this.canvas?.getBoundingClientRect();
+    const mouseX = clientX === null || !rect ? -Infinity : clientX - rect.left;
+    const nearScrollbar = mouseX >= (rect?.width ?? 0) - this.SCROLLBAR_HOVER_SENSOR_SIZE;
+    const active = clientX !== null && nearScrollbar;
+    if (active === this.scrollbarHoverActive) return;
+
+    this.scrollbarHoverActive = active;
+    if (active) this.showScrollbar();
+
+    if (this.scrollbarHoverAnimationFrame) {
+      cancelAnimationFrame(this.scrollbarHoverAnimationFrame);
+      this.scrollbarHoverAnimationFrame = undefined;
+    }
+
+    const startProgress = this.renderer?.getScrollbarWidth() ?? SCROLLBAR_BASE_WIDTH;
+    const start =
+      (startProgress - SCROLLBAR_BASE_WIDTH) / (SCROLLBAR_EXPANDED_WIDTH - SCROLLBAR_BASE_WIDTH);
+    const target = active ? 1 : 0;
+    const startTime = performance.now();
+    const animate = (now: number) => {
+      if (!this.renderer) return;
+      const progress = Math.min(1, (now - startTime) / this.SCROLLBAR_HOVER_ANIMATION_MS);
+      const eased = progress * (2 - progress);
+      this.renderer.setScrollbarHoverProgress(start + (target - start) * eased);
+      this.requestRender({ full: true, reason: 'explicit' });
+      if (progress < 1) {
+        this.scrollbarHoverAnimationFrame = requestAnimationFrame(animate);
+      } else {
+        this.scrollbarHoverAnimationFrame = undefined;
+      }
+    };
+    this.scrollbarHoverAnimationFrame = requestAnimationFrame(animate);
+  }
+
   /**
    * Show scrollbar with fade-in and schedule auto-hide
    */
@@ -1947,6 +2006,10 @@ export class Terminal implements ITerminalCore {
     // Schedule auto-hide (unless dragging)
     if (!this.isDraggingScrollbar) {
       this.scrollbarHideTimeout = window.setTimeout(() => {
+        if (this.scrollbarHoverActive) {
+          this.showScrollbar();
+          return;
+        }
         this.hideScrollbar();
       }, this.SCROLLBAR_HIDE_DELAY_MS);
     }
