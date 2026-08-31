@@ -36,7 +36,6 @@ export interface IRenderable {
 export interface IScrollbackProvider {
   getScrollbackLine(offset: number): GhosttyCell[] | null;
   getScrollbackLength(): number;
-  normalizeViewportBounds?(viewportY?: number): number;
 }
 
 export const SCROLLBAR_BASE_WIDTH = 3;
@@ -384,9 +383,7 @@ export class CanvasRenderer {
     const dims = buffer.getDimensions();
     const scrollbackLength = scrollbackProvider ? scrollbackProvider.getScrollbackLength() : 0;
     const requestedViewportY = Number.isFinite(viewportY) ? viewportY : 0;
-    viewportY = scrollbackProvider?.normalizeViewportBounds
-      ? scrollbackProvider.normalizeViewportBounds(requestedViewportY)
-      : Math.max(0, Math.min(scrollbackLength, requestedViewportY));
+    viewportY = Math.max(0, Math.min(scrollbackLength, requestedViewportY));
 
     if (buffer.needsFullRedraw?.()) {
       forceAll = true;

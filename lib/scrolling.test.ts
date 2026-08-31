@@ -501,7 +501,7 @@ describe('Scrolling Methods', () => {
 
     term.viewportY = scrollbackLength + 20;
     (term as any).targetViewportY = scrollbackLength + 40;
-    (term as any).renderer.render(term.wasmTerm, true, term.viewportY, term, 1);
+    expect(term.renderNow(true)).toBe(true);
 
     expect(term.viewportY).toBe(scrollbackLength);
     expect((term as any).targetViewportY).toBe(scrollbackLength);

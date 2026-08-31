@@ -3325,6 +3325,11 @@ describe('Scrollback Viewport Stability', () => {
       expect((term as any).renderFullNextFrame).toBe(true);
       expect((term as any).renderRetryTimer).toBeDefined();
 
+      // A later request must not cancel the retry that will recover a failed
+      // materialization when the browser has already throttled the next RAF.
+      term.requestRender({ reason: 'output' });
+      expect((term as any).renderRetryTimer).toBeDefined();
+
       renderer.render = originalRender as typeof renderer.render;
       expect(term.renderNow(true)).toBe(true);
       expect(renderEvents).toBe(1);
@@ -3333,6 +3338,30 @@ describe('Scrollback Viewport Stability', () => {
     } finally {
       renderer.render = originalRender as typeof renderer.render;
       subscription.dispose();
+      term.dispose();
+    }
+  });
+
+  test('keeps render requests pending while suppression is active', async () => {
+    if (!container) return;
+
+    const term = await createIsolatedTerminal({ cols: 20, rows: 5 });
+    term.open(container);
+
+    try {
+      const before = term.getRenderDiagnostics();
+      term.beginRenderSuppression();
+      term.requestRender({ full: true, reason: 'replay' });
+
+      const held = term.getRenderDiagnostics();
+      expect(held.scheduledFrameCount).toBe(before.scheduledFrameCount);
+      expect(held.pendingReasons).toEqual(['replay']);
+
+      term.endRenderSuppression();
+      expect(term.getRenderDiagnostics().scheduledFrameCount).toBe(before.scheduledFrameCount + 1);
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      expect(term.getRenderDiagnostics().pendingReasons).toEqual([]);
+    } finally {
       term.dispose();
     }
   });

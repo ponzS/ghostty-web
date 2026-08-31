@@ -58,11 +58,6 @@ export function getGhostty(): Ghostty {
 
 // Main Terminal class
 export { Terminal } from './terminal';
-export { TerminalWorkScheduler } from './terminal-work-scheduler';
-export type {
-  TerminalWorkSchedulerOptions,
-  TerminalWorkSchedulerDiagnostics,
-} from './terminal-work-scheduler';
 
 // xterm.js-compatible interfaces
 export type {

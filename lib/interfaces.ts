@@ -65,7 +65,6 @@ export interface ISemanticCheckpointAdapter {
   importSemanticState(state: unknown): void;
 }
 
-
 export interface ITerminalAddon {
   activate(terminal: ITerminalCore): void;
   dispose(): void;

@@ -17,10 +17,10 @@
 
 import { BufferNamespace } from './buffer';
 import { EventEmitter } from './event-emitter';
-import type { ISemanticCheckpointAdapter } from './interfaces';
 import type { Ghostty, GhosttyCell, GhosttyTerminal, GhosttyTerminalConfig } from './ghostty';
 import { getGhostty } from './index';
 import { InputHandler, type MouseTrackingConfig } from './input-handler';
+import type { ISemanticCheckpointAdapter } from './interfaces';
 import type {
   IBufferNamespace,
   IBufferRange,
@@ -36,10 +36,10 @@ import { LinkDetector } from './link-detector';
 import { OSC8LinkProvider } from './providers/osc8-link-provider';
 import { UrlRegexProvider } from './providers/url-regex-provider';
 import {
+  CanvasRenderer,
   SCROLLBAR_BASE_WIDTH,
   SCROLLBAR_EXPANDED_WIDTH,
   SCROLLBAR_RIGHT_INSET,
-  CanvasRenderer,
 } from './renderer';
 import { SelectionManager } from './selection-manager';
 import type { ILink, ILinkProvider } from './types';
@@ -610,7 +610,8 @@ export class Terminal implements ITerminalCore {
     render = true,
     full = true,
   }: { render?: boolean; full?: boolean } = {}): void {
-    this.renderSuppressionDepth = Math.max(0, this.renderSuppressionDepth - 1);
+    if (this.renderSuppressionDepth <= 0) return;
+    this.renderSuppressionDepth -= 1;
     if (this.renderSuppressionDepth === 0 && render && this.isOpen && !this.isDisposed) {
       this.requestRender({ full, reason: 'explicit' });
     }
@@ -1221,6 +1222,7 @@ export class Terminal implements ITerminalCore {
 
     this.isDisposed = true;
     this.isOpen = false;
+    this.renderSuppressionDepth = 0;
 
     // Stop render loop and clear write queue
     this.cancelRenderLoop();
@@ -1274,7 +1276,7 @@ export class Terminal implements ITerminalCore {
    * Cancel the render loop
    */
   private cancelRenderLoop(): void {
-    if (this.animationFrameId) {
+    if (this.animationFrameId !== undefined) {
       cancelAnimationFrame(this.animationFrameId);
       this.animationFrameId = undefined;
     }
@@ -1296,11 +1298,10 @@ export class Terminal implements ITerminalCore {
 
     this.renderDiagnostics.renderRequestCount++;
     this.pendingRenderReasons.add(options.reason ?? 'explicit');
-    if (this.renderRetryTimer !== undefined) {
-      window.clearTimeout(this.renderRetryTimer);
-      this.renderRetryTimer = undefined;
-    }
     this.renderFullNextFrame = this.renderFullNextFrame || options.full === true;
+    // Replay and resize owners deliberately hold rendering. Keep the request
+    // pending and let the owner schedule the first frame after releasing it.
+    if (this.renderSuppressionDepth > 0) return;
     if (this.animationFrameId !== undefined) return;
 
     this.renderDiagnostics.scheduledFrameCount++;
@@ -1309,10 +1310,6 @@ export class Terminal implements ITerminalCore {
       const reasons = [...this.pendingRenderReasons];
       this.animationFrameId = undefined;
       if (this.renderSuppressionDepth > 0) {
-        this.renderFullNextFrame = this.renderFullNextFrame || fullRender;
-        for (const reason of reasons) {
-          this.pendingRenderReasons.add(reason);
-        }
         return;
       }
       this.renderFullNextFrame = false;
@@ -1344,7 +1341,7 @@ export class Terminal implements ITerminalCore {
     const rendered = this.renderer.render(
       this.wasmTerm,
       forceAll,
-      this.viewportY,
+      this.normalizeViewportBounds(this.viewportY),
       this,
       this.scrollbarOpacity
     );
@@ -1950,7 +1947,7 @@ export class Terminal implements ITerminalCore {
     }
 
     const rect = this.canvas?.getBoundingClientRect();
-    const mouseX = clientX === null || !rect ? -Infinity : clientX - rect.left;
+    const mouseX = clientX === null || !rect ? Number.NEGATIVE_INFINITY : clientX - rect.left;
     const nearScrollbar = mouseX >= (rect?.width ?? 0) - this.SCROLLBAR_HOVER_SENSOR_SIZE;
     const active = clientX !== null && nearScrollbar;
     if (active === this.scrollbarHoverActive) return;
