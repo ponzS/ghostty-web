@@ -392,21 +392,40 @@ export class GhosttyTerminal {
 
   write(data: string | Uint8Array): void {
     const bytes = typeof data === 'string' ? new TextEncoder().encode(data) : data;
+    if (bytes.length === 0) return;
     const ptr = this.exports.ghostty_wasm_alloc_u8_array(bytes.length);
-    new Uint8Array(this.memory.buffer).set(bytes, ptr);
-    this.exports.ghostty_terminal_write(this.handle, ptr, bytes.length);
-    this.exports.ghostty_wasm_free_u8_array(ptr, bytes.length);
-    this.renderStateCurrent = false;
+    if (!ptr) throw new Error('Failed to allocate terminal input');
+    try {
+      new Uint8Array(this.memory.buffer).set(bytes, ptr >>> 0);
+      this.renderStateCurrent = false;
+      if (this.exports.ghostty_terminal_write(this.handle, ptr, bytes.length) !== 1) {
+        throw new Error('Terminal parser failed; runtime recovery is required');
+      }
+    } finally {
+      this.exports.ghostty_wasm_free_u8_array(ptr, bytes.length);
+    }
   }
 
   resize(cols: number, rows: number): void {
+    if (
+      !Number.isInteger(cols) ||
+      !Number.isInteger(rows) ||
+      cols < 1 ||
+      rows < 1 ||
+      cols > 65535 ||
+      rows > 65535
+    ) {
+      throw new Error('Invalid terminal dimensions');
+    }
     if (cols === this._cols && rows === this._rows) return;
     this.ensureScrollbackCapacity(cols, rows);
-    this._cols = cols;
-    this._rows = rows;
-    this.exports.ghostty_terminal_resize(this.handle, cols, rows);
     this.renderStateCurrent = false;
     this.invalidateBuffers();
+    if (this.exports.ghostty_terminal_resize(this.handle, cols, rows) !== 1) {
+      throw new Error('Terminal resize failed; runtime recovery is required');
+    }
+    this._cols = cols;
+    this._rows = rows;
     this.initCellPool();
   }
 

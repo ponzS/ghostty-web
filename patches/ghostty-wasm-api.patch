@@ -137,12 +137,12 @@ index 000000000..c467102c3
 +void ghostty_terminal_free(GhosttyTerminal term);
 +
 +/** Resize terminal */
-+void ghostty_terminal_resize(GhosttyTerminal term, int cols, int rows);
++int ghostty_terminal_resize(GhosttyTerminal term, int cols, int rows);
 +/** Raise the native scrollback byte capacity before a wider reflow. */
 +void ghostty_terminal_set_scrollback_limit(GhosttyTerminal term, uint32_t max_bytes);
 +
 +/** Write data to terminal (parses VT sequences) */
-+void ghostty_terminal_write(GhosttyTerminal term, const uint8_t* data, size_t len);
++int ghostty_terminal_write(GhosttyTerminal term, const uint8_t* data, size_t len);
 +
 +/* ============================================================================
 + * RenderState API - High-performance rendering
@@ -926,9 +926,9 @@ index 000000000..73ae2e6fa
 +    alloc.destroy(wrapper);
 +}
 +
-+pub fn resize(ptr: ?*anyopaque, cols: c_int, rows: c_int) callconv(.c) void {
-+    const wrapper: *TerminalWrapper = @ptrCast(@alignCast(ptr orelse return));
-+    wrapper.terminal.resize(wrapper.alloc, @intCast(cols), @intCast(rows)) catch return;
++pub fn resize(ptr: ?*anyopaque, cols: c_int, rows: c_int) callconv(.c) c_int {
++    const wrapper: *TerminalWrapper = @ptrCast(@alignCast(ptr orelse return 0));
++    wrapper.terminal.resize(wrapper.alloc, @intCast(cols), @intCast(rows)) catch return 0; return 1;
 +}
 +
 +pub fn setScrollbackLimit(ptr: ?*anyopaque, max_bytes: u32) callconv(.c) void {
@@ -940,9 +940,9 @@ index 000000000..73ae2e6fa
 +    }
 +}
 +
-+pub fn write(ptr: ?*anyopaque, data: [*]const u8, len: usize) callconv(.c) void {
-+    const wrapper: *TerminalWrapper = @ptrCast(@alignCast(ptr orelse return));
-+    wrapper.stream.nextSlice(data[0..len]) catch return;
++pub fn write(ptr: ?*anyopaque, data: [*]const u8, len: usize) callconv(.c) c_int {
++    const wrapper: *TerminalWrapper = @ptrCast(@alignCast(ptr orelse return 0));
++    wrapper.stream.nextSlice(data[0..len]) catch return 0; return 1;
 +}
 +
 +// ============================================================================

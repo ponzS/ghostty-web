@@ -102,6 +102,11 @@ export class Terminal implements ITerminalCore {
   private isDisposed = false;
   private animationFrameId?: number;
   private renderFullNextFrame = false;
+  private renderTaskPending = false;
+  private renderThrottleTimer?: number;
+  private lastRenderAt = 0;
+  public scheduleRender?: (callback: () => void) => boolean;
+  public cancelScheduledRender?: () => void;
   private renderRetryTimer?: number;
   private renderRetryDelayMs = 16;
   private writeQueue: Uint8Array[] = [];
@@ -540,7 +545,7 @@ export class Terminal implements ITerminalCore {
   /**
    * Write data to terminal
    */
-  write(data: string | Uint8Array, callback?: () => void): void {
+  write(data: string | Uint8Array, callback?: () => void): void | Promise<void> {
     this.assertOpen();
 
     // Handle convertEol option
@@ -548,7 +553,7 @@ export class Terminal implements ITerminalCore {
       data = data.replace(/\n/g, '\r\n');
     }
 
-    this.writeInternal(data, callback);
+    return this.writeInternal(data, callback);
   }
 
   /**
@@ -586,7 +591,7 @@ export class Terminal implements ITerminalCore {
     // Invalidate link cache (content changed)
     this.linkDetector?.invalidateCache();
 
-    this.requestRender({ full: true });
+    this.requestRender({ full: true, throttle: true });
 
     if (wasAtBottom) {
       this.scrollToBottom();
@@ -710,13 +715,11 @@ export class Terminal implements ITerminalCore {
     // cleared via requestAnimationFrame (rAF is throttled/paused in background tabs).
     this.cancelRenderLoop();
 
-    try {
-      // Update dimensions
+    {
+      // Commit cached dimensions only after the native resize succeeds.
+      this.wasmTerm!.resize(cols, rows);
       this.cols = cols;
       this.rows = rows;
-
-      // Resize WASM terminal (may reallocate buffers, invalidating TypedArray views)
-      this.wasmTerm!.resize(cols, rows);
 
       // Resize renderer
       this.renderer!.resize(cols, rows);
@@ -732,8 +735,6 @@ export class Terminal implements ITerminalCore {
       this.resizeEmitter.fire({ cols, rows });
 
       this.requestRender({ full: true });
-    } catch (e) {
-      console.error('Terminal resize failed:', e);
     }
 
     // Flush writes queued during resize. Their WASM writes invalidate the snapshot.
@@ -1205,7 +1206,13 @@ export class Terminal implements ITerminalCore {
   /**
    * Cancel the render loop
    */
-  private cancelRenderLoop(): void {
+  public cancelRenderLoop(): void {
+    this.cancelScheduledRender?.();
+    this.renderTaskPending = false;
+    if (this.renderThrottleTimer !== undefined) {
+      window.clearTimeout(this.renderThrottleTimer);
+      this.renderThrottleTimer = undefined;
+    }
     if (this.animationFrameId) {
       cancelAnimationFrame(this.animationFrameId);
       this.animationFrameId = undefined;
@@ -1223,22 +1230,43 @@ export class Terminal implements ITerminalCore {
   }
 
   /** Schedule one coalesced render frame. */
-  public requestRender(options: { full?: boolean } = {}): void {
+  public requestRender(options: { full?: boolean; throttle?: boolean } = {}): void {
     if (this.isDisposed || !this.isOpen) return;
+
+    this.renderFullNextFrame = this.renderFullNextFrame || options.full === true;
+    const delay = 33 - (performance.now() - this.lastRenderAt);
+    if (options.throttle && this.lastRenderAt > 0 && delay > 0) {
+      if (this.renderThrottleTimer === undefined) {
+        this.renderThrottleTimer = window.setTimeout(() => {
+          this.renderThrottleTimer = undefined;
+          this.requestRender({ throttle: true });
+        }, delay);
+      }
+      return;
+    }
+    if (this.renderThrottleTimer !== undefined) {
+      window.clearTimeout(this.renderThrottleTimer);
+      this.renderThrottleTimer = undefined;
+    }
 
     if (this.renderRetryTimer !== undefined) {
       window.clearTimeout(this.renderRetryTimer);
       this.renderRetryTimer = undefined;
     }
-    this.renderFullNextFrame = this.renderFullNextFrame || options.full === true;
-    if (this.animationFrameId !== undefined) return;
+    if (this.animationFrameId !== undefined || this.renderTaskPending) return;
 
-    this.animationFrameId = requestAnimationFrame(() => {
+    const render = () => {
       const fullRender = this.renderFullNextFrame;
       this.animationFrameId = undefined;
+      this.renderTaskPending = false;
       this.renderFullNextFrame = false;
       this.renderNow(fullRender);
-    });
+    };
+    if (this.scheduleRender) {
+      this.renderTaskPending = this.scheduleRender(render) !== false;
+    } else {
+      this.animationFrameId = requestAnimationFrame(render);
+    }
   }
 
   /** Render immediately. A failed materialization keeps the last canvas and retries. */
@@ -1263,6 +1291,7 @@ export class Terminal implements ITerminalCore {
       this.renderRetryTimer = undefined;
     }
     this.renderRetryDelayMs = 16;
+    this.lastRenderAt = performance.now();
     this.renderEmitter.fire({ start: 0, end: Math.max(0, this.rows - 1) });
     const cursor = this.wasmTerm.getCursor();
     if (cursor.y !== this.lastCursorY) {
