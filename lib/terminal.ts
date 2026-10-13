@@ -20,7 +20,6 @@ import { EventEmitter } from './event-emitter';
 import type { Ghostty, GhosttyCell, GhosttyTerminal, GhosttyTerminalConfig } from './ghostty';
 import { getGhostty } from './index';
 import { InputHandler, type MouseTrackingConfig } from './input-handler';
-import type { ISemanticCheckpointAdapter } from './interfaces';
 import type {
   IBufferNamespace,
   IBufferRange,
@@ -35,27 +34,9 @@ import type {
 import { LinkDetector } from './link-detector';
 import { OSC8LinkProvider } from './providers/osc8-link-provider';
 import { UrlRegexProvider } from './providers/url-regex-provider';
-import {
-  CanvasRenderer,
-  SCROLLBAR_BASE_WIDTH,
-  SCROLLBAR_EXPANDED_WIDTH,
-  SCROLLBAR_RIGHT_INSET,
-} from './renderer';
+import { CanvasRenderer } from './renderer';
 import { SelectionManager } from './selection-manager';
 import type { ILink, ILinkProvider } from './types';
-
-export type RenderReason = 'output' | 'replay' | 'resize' | 'selection' | 'cursor' | 'explicit';
-
-export interface TerminalRenderDiagnostics {
-  renderRequestCount: number;
-  scheduledFrameCount: number;
-  renderAttemptCount: number;
-  renderFrameCount: number;
-  fullRenderCount: number;
-  partialRenderCount: number;
-  pendingReasons: RenderReason[];
-  lastRenderReasons: RenderReason[];
-}
 
 // ============================================================================
 // Terminal Class
@@ -120,18 +101,12 @@ export class Terminal implements ITerminalCore {
   private isOpen = false;
   private isDisposed = false;
   private animationFrameId?: number;
-  private renderSuppressionDepth = 0;
   private renderFullNextFrame = false;
-  private pendingRenderReasons = new Set<RenderReason>();
-  private lastRenderReasons: RenderReason[] = [];
-  private renderDiagnostics = {
-    renderRequestCount: 0,
-    scheduledFrameCount: 0,
-    renderAttemptCount: 0,
-    renderFrameCount: 0,
-    fullRenderCount: 0,
-    partialRenderCount: 0,
-  };
+  private renderTaskPending = false;
+  private renderThrottleTimer?: number;
+  private lastRenderAt = 0;
+  public scheduleRender?: (callback: () => void) => boolean;
+  public cancelScheduledRender?: () => void;
   private renderRetryTimer?: number;
   private renderRetryDelayMs = 16;
   private writeQueue: Uint8Array[] = [];
@@ -164,10 +139,6 @@ export class Terminal implements ITerminalCore {
   private scrollbarVisible: boolean = false;
   private scrollbarOpacity: number = 0;
   private scrollbarHideTimeout?: number;
-  private scrollbarHoverAnimationFrame?: number;
-  private scrollbarHoverActive = false;
-  private readonly SCROLLBAR_HOVER_SENSOR_SIZE = 24;
-  private readonly SCROLLBAR_HOVER_ANIMATION_MS = 160;
   private readonly SCROLLBAR_HIDE_DELAY_MS = 1500; // Hide after 1.5 seconds
   private readonly SCROLLBAR_FADE_DURATION_MS = 200; // 200ms fade animation
 
@@ -574,7 +545,7 @@ export class Terminal implements ITerminalCore {
   /**
    * Write data to terminal
    */
-  write(data: string | Uint8Array, callback?: () => void): void {
+  write(data: string | Uint8Array, callback?: () => void): void | Promise<void> {
     this.assertOpen();
 
     // Handle convertEol option
@@ -582,42 +553,12 @@ export class Terminal implements ITerminalCore {
       data = data.replace(/\n/g, '\r\n');
     }
 
-    this.writeInternal(data, callback);
+    return this.writeInternal(data, callback);
   }
 
   /**
-   * Parse replay bytes without presenting intermediate frames.
-   *
-   * Writes remain synchronous; only renderer work is deferred until the
-   * surrounding presentation transaction releases suppression.
+   * Internal write implementation (extracted from write())
    */
-  public writeReplay(data: string | Uint8Array): void {
-    this.beginRenderSuppression();
-    try {
-      this.write(data);
-    } finally {
-      this.endRenderSuppression({ render: false });
-    }
-  }
-
-  /** Defer all renderer work while preserving pending render state. */
-  public beginRenderSuppression(): void {
-    this.renderSuppressionDepth += 1;
-  }
-
-  /** Release one suppression scope and optionally schedule the final frame. */
-  public endRenderSuppression({
-    render = true,
-    full = true,
-  }: { render?: boolean; full?: boolean } = {}): void {
-    if (this.renderSuppressionDepth <= 0) return;
-    this.renderSuppressionDepth -= 1;
-    if (this.renderSuppressionDepth === 0 && render && this.isOpen && !this.isDisposed) {
-      this.requestRender({ full, reason: 'explicit' });
-    }
-  }
-
-  /** Internal write implementation (extracted from write()) */
   private writeInternal(data: string | Uint8Array, callback?: () => void): void {
     // Note: We intentionally do NOT clear selection on write - most modern terminals
     // preserve selection when new data arrives. Selection is cleared by user actions
@@ -650,7 +591,7 @@ export class Terminal implements ITerminalCore {
     // Invalidate link cache (content changed)
     this.linkDetector?.invalidateCache();
 
-    this.requestRender({ full: true, reason: 'output' });
+    this.requestRender({ full: true, throttle: true });
 
     if (wasAtBottom) {
       this.scrollToBottom();
@@ -774,13 +715,11 @@ export class Terminal implements ITerminalCore {
     // cleared via requestAnimationFrame (rAF is throttled/paused in background tabs).
     this.cancelRenderLoop();
 
-    try {
-      // Update dimensions
+    {
+      // Commit cached dimensions only after the native resize succeeds.
+      this.wasmTerm!.resize(cols, rows);
       this.cols = cols;
       this.rows = rows;
-
-      // Resize WASM terminal (may reallocate buffers, invalidating TypedArray views)
-      this.wasmTerm!.resize(cols, rows);
 
       // Resize renderer
       this.renderer!.resize(cols, rows);
@@ -795,9 +734,7 @@ export class Terminal implements ITerminalCore {
       // Fire resize event
       this.resizeEmitter.fire({ cols, rows });
 
-      this.requestRender({ full: true, reason: 'resize' });
-    } catch (e) {
-      console.error('Terminal resize failed:', e);
+      this.requestRender({ full: true });
     }
 
     // Flush writes queued during resize. Their WASM writes invalidate the snapshot.
@@ -811,7 +748,7 @@ export class Terminal implements ITerminalCore {
     this.assertOpen();
     // Send ANSI clear screen and cursor home sequences
     this.wasmTerm!.write('\x1b[2J\x1b[H');
-    this.requestRender({ full: true, reason: 'explicit' });
+    this.requestRender({ full: true });
   }
 
   /**
@@ -827,15 +764,12 @@ export class Terminal implements ITerminalCore {
     const config = this.buildWasmConfig();
     this.wasmTerm = this.ghostty!.createTerminal(this.cols, this.rows, config);
 
-    // Clear renderer only outside a presentation transaction. During replay,
-    // the caller keeps the last frame visible until the final full render.
-    if (this.renderSuppressionDepth === 0) {
-      this.renderer!.clear();
-    }
+    // Clear renderer
+    this.renderer!.clear();
 
     // Reset title
     this.currentTitle = '';
-    this.requestRender({ full: true, reason: 'explicit' });
+    this.requestRender({ full: true });
   }
 
   /**
@@ -1222,13 +1156,10 @@ export class Terminal implements ITerminalCore {
 
     this.isDisposed = true;
     this.isOpen = false;
-    this.renderSuppressionDepth = 0;
 
     // Stop render loop and clear write queue
     this.cancelRenderLoop();
     this.writeQueue.length = 0;
-    this.pendingRenderReasons.clear();
-    this.lastRenderReasons = [];
 
     // Stop smooth scroll animation
     if (this.scrollAnimationFrame) {
@@ -1275,8 +1206,14 @@ export class Terminal implements ITerminalCore {
   /**
    * Cancel the render loop
    */
-  private cancelRenderLoop(): void {
-    if (this.animationFrameId !== undefined) {
+  public cancelRenderLoop(): void {
+    this.cancelScheduledRender?.();
+    this.renderTaskPending = false;
+    if (this.renderThrottleTimer !== undefined) {
+      window.clearTimeout(this.renderThrottleTimer);
+      this.renderThrottleTimer = undefined;
+    }
+    if (this.animationFrameId) {
       cancelAnimationFrame(this.animationFrameId);
       this.animationFrameId = undefined;
     }
@@ -1293,70 +1230,60 @@ export class Terminal implements ITerminalCore {
   }
 
   /** Schedule one coalesced render frame. */
-  public requestRender(options: { full?: boolean; reason?: RenderReason } = {}): void {
+  public requestRender(options: { full?: boolean; throttle?: boolean } = {}): void {
     if (this.isDisposed || !this.isOpen) return;
 
-    this.renderDiagnostics.renderRequestCount++;
-    this.pendingRenderReasons.add(options.reason ?? 'explicit');
     this.renderFullNextFrame = this.renderFullNextFrame || options.full === true;
-    // Replay and resize owners deliberately hold rendering. Keep the request
-    // pending and let the owner schedule the first frame after releasing it.
-    if (this.renderSuppressionDepth > 0) return;
-    if (this.animationFrameId !== undefined) return;
-
-    this.renderDiagnostics.scheduledFrameCount++;
-    this.animationFrameId = requestAnimationFrame(() => {
-      const fullRender = this.renderFullNextFrame;
-      const reasons = [...this.pendingRenderReasons];
-      this.animationFrameId = undefined;
-      if (this.renderSuppressionDepth > 0) {
-        return;
+    const delay = 33 - (performance.now() - this.lastRenderAt);
+    if (options.throttle && this.lastRenderAt > 0 && delay > 0) {
+      if (this.renderThrottleTimer === undefined) {
+        this.renderThrottleTimer = window.setTimeout(() => {
+          this.renderThrottleTimer = undefined;
+          this.requestRender({ throttle: true });
+        }, delay);
       }
-      this.renderFullNextFrame = false;
-      this.pendingRenderReasons.clear();
-      this.lastRenderReasons = reasons;
-      this.renderNow(fullRender);
-    });
-  }
+      return;
+    }
+    if (this.renderThrottleTimer !== undefined) {
+      window.clearTimeout(this.renderThrottleTimer);
+      this.renderThrottleTimer = undefined;
+    }
 
-  /** Return a copy of render scheduling counters and the latest merged reasons. */
-  public getRenderDiagnostics(): TerminalRenderDiagnostics {
-    return {
-      ...this.renderDiagnostics,
-      pendingReasons: [...this.pendingRenderReasons],
-      lastRenderReasons: [...this.lastRenderReasons],
+    if (this.renderRetryTimer !== undefined) {
+      window.clearTimeout(this.renderRetryTimer);
+      this.renderRetryTimer = undefined;
+    }
+    if (this.animationFrameId !== undefined || this.renderTaskPending) return;
+
+    const render = () => {
+      const fullRender = this.renderFullNextFrame;
+      this.animationFrameId = undefined;
+      this.renderTaskPending = false;
+      this.renderFullNextFrame = false;
+      this.renderNow(fullRender);
     };
+    if (this.scheduleRender) {
+      this.renderTaskPending = this.scheduleRender(render) !== false;
+    } else {
+      this.animationFrameId = requestAnimationFrame(render);
+    }
   }
 
   /** Render immediately. A failed materialization keeps the last canvas and retries. */
   public renderNow(forceAll: boolean = false): boolean {
     if (this.isDisposed || !this.isOpen || !this.renderer || !this.wasmTerm) return false;
-    if (this.renderSuppressionDepth > 0) {
-      this.renderFullNextFrame = this.renderFullNextFrame || forceAll;
-      this.pendingRenderReasons.add(forceAll ? 'explicit' : 'output');
-      return false;
-    }
 
-    this.renderDiagnostics.renderAttemptCount++;
     const rendered = this.renderer.render(
       this.wasmTerm,
       forceAll,
-      this.normalizeViewportBounds(this.viewportY),
+      this.viewportY,
       this,
       this.scrollbarOpacity
     );
     if (!rendered) {
       this.renderFullNextFrame = true;
-      this.pendingRenderReasons.add('explicit');
       this.scheduleRenderRetry();
       return false;
-    }
-
-    this.renderDiagnostics.renderFrameCount++;
-    if (forceAll) {
-      this.renderDiagnostics.fullRenderCount++;
-    } else {
-      this.renderDiagnostics.partialRenderCount++;
     }
 
     if (this.renderRetryTimer !== undefined) {
@@ -1364,6 +1291,7 @@ export class Terminal implements ITerminalCore {
       this.renderRetryTimer = undefined;
     }
     this.renderRetryDelayMs = 16;
+    this.lastRenderAt = performance.now();
     this.renderEmitter.fire({ start: 0, end: Math.max(0, this.rows - 1) });
     const cursor = this.wasmTerm.getCursor();
     if (cursor.y !== this.lastCursorY) {
@@ -1386,7 +1314,7 @@ export class Terminal implements ITerminalCore {
     this.renderRetryDelayMs = Math.min(250, delay * 2);
     this.renderRetryTimer = window.setTimeout(() => {
       this.renderRetryTimer = undefined;
-      this.requestRender({ full: true, reason: 'explicit' });
+      this.requestRender({ full: true });
     }, delay);
   }
 
@@ -1394,11 +1322,6 @@ export class Terminal implements ITerminalCore {
    * Get a line from native WASM scrollback buffer
    * Implements IScrollbackProvider
    */
-  /** Semantic checkpoint support is opt-in and requires a complete WASM adapter. */
-  public getSemanticCheckpointAdapter(): ISemanticCheckpointAdapter | null {
-    return null;
-  }
-
   public getScrollbackLine(offset: number): GhosttyCell[] | null {
     if (!this.wasmTerm) return null;
     return this.wasmTerm.getScrollbackLine(offset);
@@ -1468,10 +1391,6 @@ export class Terminal implements ITerminalCore {
     }
 
     // Clean up scrollbar timers
-    if (this.scrollbarHoverAnimationFrame) {
-      cancelAnimationFrame(this.scrollbarHoverAnimationFrame);
-      this.scrollbarHoverAnimationFrame = undefined;
-    }
     if (this.scrollbarHideTimeout) {
       window.clearTimeout(this.scrollbarHideTimeout);
       this.scrollbarHideTimeout = undefined;
@@ -1519,8 +1438,6 @@ export class Terminal implements ITerminalCore {
       this.processScrollbarDrag(e);
       return;
     }
-
-    this.updateScrollbarHover(e.clientX);
 
     if (!this.linkDetector) return;
 
@@ -1682,8 +1599,6 @@ export class Terminal implements ITerminalCore {
    * Handle mouse leave to clear link hover
    */
   private handleMouseLeave = (): void => {
-    this.updateScrollbarHover(null);
-
     // Clear hyperlink underline
     if (this.renderer && this.wasmTerm) {
       const previousHyperlinkId = (this.renderer as any).hoveredHyperlinkId || 0;
@@ -1839,13 +1754,12 @@ export class Terminal implements ITerminalCore {
     // Use rect dimensions which are already in CSS pixels
     const canvasWidth = rect.width;
     const canvasHeight = rect.height;
-    const scrollbarWidth = SCROLLBAR_EXPANDED_WIDTH;
-    const scrollbarX = canvasWidth - scrollbarWidth - SCROLLBAR_RIGHT_INSET;
+    const scrollbarWidth = 8;
+    const scrollbarX = canvasWidth - scrollbarWidth - 4;
     const scrollbarPadding = 4;
 
-    // Check the expanded hit area so a quick click near the right edge can grab it.
-    if (mouseX >= scrollbarX && mouseX <= canvasWidth - SCROLLBAR_RIGHT_INSET) {
-      this.updateScrollbarHover(e.clientX);
+    // Check if click is in scrollbar area
+    if (mouseX >= scrollbarX && mouseX <= scrollbarX + scrollbarWidth) {
       // Prevent default and stop propagation to prevent text selection
       e.preventDefault();
       e.stopPropagation();
@@ -1936,50 +1850,6 @@ export class Terminal implements ITerminalCore {
     this.scrollToLine(Math.max(0, Math.min(scrollbackLength, newViewportY)));
   }
 
-  private updateScrollbarHover(clientX: number | null): void {
-    if (
-      !this.canvas ||
-      !this.renderer ||
-      !this.wasmTerm ||
-      this.wasmTerm.getScrollbackLength() === 0
-    ) {
-      clientX = null;
-    }
-
-    const rect = this.canvas?.getBoundingClientRect();
-    const mouseX = clientX === null || !rect ? Number.NEGATIVE_INFINITY : clientX - rect.left;
-    const nearScrollbar = mouseX >= (rect?.width ?? 0) - this.SCROLLBAR_HOVER_SENSOR_SIZE;
-    const active = clientX !== null && nearScrollbar;
-    if (active === this.scrollbarHoverActive) return;
-
-    this.scrollbarHoverActive = active;
-    if (active) this.showScrollbar();
-
-    if (this.scrollbarHoverAnimationFrame) {
-      cancelAnimationFrame(this.scrollbarHoverAnimationFrame);
-      this.scrollbarHoverAnimationFrame = undefined;
-    }
-
-    const startProgress = this.renderer?.getScrollbarWidth() ?? SCROLLBAR_BASE_WIDTH;
-    const start =
-      (startProgress - SCROLLBAR_BASE_WIDTH) / (SCROLLBAR_EXPANDED_WIDTH - SCROLLBAR_BASE_WIDTH);
-    const target = active ? 1 : 0;
-    const startTime = performance.now();
-    const animate = (now: number) => {
-      if (!this.renderer) return;
-      const progress = Math.min(1, (now - startTime) / this.SCROLLBAR_HOVER_ANIMATION_MS);
-      const eased = progress * (2 - progress);
-      this.renderer.setScrollbarHoverProgress(start + (target - start) * eased);
-      this.requestRender({ full: true, reason: 'explicit' });
-      if (progress < 1) {
-        this.scrollbarHoverAnimationFrame = requestAnimationFrame(animate);
-      } else {
-        this.scrollbarHoverAnimationFrame = undefined;
-      }
-    };
-    this.scrollbarHoverAnimationFrame = requestAnimationFrame(animate);
-  }
-
   /**
    * Show scrollbar with fade-in and schedule auto-hide
    */
@@ -2003,10 +1873,6 @@ export class Terminal implements ITerminalCore {
     // Schedule auto-hide (unless dragging)
     if (!this.isDraggingScrollbar) {
       this.scrollbarHideTimeout = window.setTimeout(() => {
-        if (this.scrollbarHoverActive) {
-          this.showScrollbar();
-          return;
-        }
         this.hideScrollbar();
       }, this.SCROLLBAR_HIDE_DELAY_MS);
     }

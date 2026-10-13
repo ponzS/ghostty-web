@@ -169,11 +169,6 @@ describe('Terminal', () => {
       expect(term.rows).toBe(25);
     });
 
-    test('does not advertise an incomplete semantic checkpoint adapter', async () => {
-      const term = await createIsolatedTerminal();
-      expect(term.getSemanticCheckpointAdapter()).toBeNull();
-      term.dispose();
-    });
     test('exposes element after open', async () => {
       const term = await createIsolatedTerminal();
       expect(term.element).toBeUndefined();
@@ -3325,11 +3320,6 @@ describe('Scrollback Viewport Stability', () => {
       expect((term as any).renderFullNextFrame).toBe(true);
       expect((term as any).renderRetryTimer).toBeDefined();
 
-      // A later request must not cancel the retry that will recover a failed
-      // materialization when the browser has already throttled the next RAF.
-      term.requestRender({ reason: 'output' });
-      expect((term as any).renderRetryTimer).toBeDefined();
-
       renderer.render = originalRender as typeof renderer.render;
       expect(term.renderNow(true)).toBe(true);
       expect(renderEvents).toBe(1);
@@ -3338,92 +3328,6 @@ describe('Scrollback Viewport Stability', () => {
     } finally {
       renderer.render = originalRender as typeof renderer.render;
       subscription.dispose();
-      term.dispose();
-    }
-  });
-
-  test('keeps render requests pending while suppression is active', async () => {
-    if (!container) return;
-
-    const term = await createIsolatedTerminal({ cols: 20, rows: 5 });
-    term.open(container);
-
-    try {
-      const before = term.getRenderDiagnostics();
-      term.beginRenderSuppression();
-      term.requestRender({ full: true, reason: 'replay' });
-
-      const held = term.getRenderDiagnostics();
-      expect(held.scheduledFrameCount).toBe(before.scheduledFrameCount);
-      expect(held.pendingReasons).toEqual(['replay']);
-
-      term.endRenderSuppression();
-      expect(term.getRenderDiagnostics().scheduledFrameCount).toBe(before.scheduledFrameCount + 1);
-      await new Promise((resolve) => setTimeout(resolve, 50));
-      expect(term.getRenderDiagnostics().pendingReasons).toEqual([]);
-    } finally {
-      term.dispose();
-    }
-  });
-
-  test('suppresses all renderer work across a presentation transaction', async () => {
-    if (!container) return;
-
-    const term = await createIsolatedTerminal({ cols: 20, rows: 5 });
-    term.open(container);
-    const renderer = term.renderer!;
-    const originalRender = renderer.render;
-    let renderCalls = 0;
-    renderer.render = ((...args: Parameters<typeof renderer.render>) => {
-      renderCalls++;
-      return originalRender.apply(renderer, args);
-    }) as typeof renderer.render;
-
-    try {
-      term.beginRenderSuppression();
-      term.beginRenderSuppression();
-      term.write('hidden replay');
-      expect(term.renderNow(true)).toBe(false);
-      expect(renderCalls).toBe(0);
-
-      term.endRenderSuppression();
-      expect(term.renderNow(true)).toBe(false);
-      expect(renderCalls).toBe(0);
-
-      term.endRenderSuppression({ render: false });
-      expect(term.renderNow(true)).toBe(true);
-      expect(renderCalls).toBe(1);
-    } finally {
-      renderer.render = originalRender as typeof renderer.render;
-      term.dispose();
-    }
-  });
-  test('coalesces render requests and records merged reasons', async () => {
-    if (!container) return;
-
-    const term = await createIsolatedTerminal({ cols: 20, rows: 5 });
-    term.open(container);
-
-    try {
-      const before = term.getRenderDiagnostics();
-      term.requestRender({ reason: 'selection' });
-      term.requestRender({ full: true, reason: 'resize' });
-      term.requestRender({ reason: 'output' });
-
-      const pending = term.getRenderDiagnostics();
-      expect(pending.renderRequestCount).toBe(before.renderRequestCount + 3);
-      expect(pending.scheduledFrameCount).toBe(before.scheduledFrameCount + 1);
-      expect(pending.pendingReasons).toEqual(['selection', 'resize', 'output']);
-
-      await new Promise((resolve) => setTimeout(resolve, 50));
-
-      const after = term.getRenderDiagnostics();
-      expect(after.scheduledFrameCount).toBe(before.scheduledFrameCount + 1);
-      expect(after.renderFrameCount).toBeGreaterThanOrEqual(before.renderFrameCount + 1);
-      expect(after.fullRenderCount).toBeGreaterThanOrEqual(before.fullRenderCount + 1);
-      expect(after.lastRenderReasons).toEqual(['selection', 'resize', 'output']);
-      expect(after.pendingReasons).toEqual([]);
-    } finally {
       term.dispose();
     }
   });

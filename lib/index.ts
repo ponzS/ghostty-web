@@ -64,7 +64,6 @@ export type {
   ITerminalOptions,
   ITheme,
   ITerminalAddon,
-  ISemanticCheckpointAdapter,
   ITerminalCore,
   IDisposable,
   IEvent,

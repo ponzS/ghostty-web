@@ -60,11 +60,6 @@ export interface IDisposable {
 
 export type IEvent<T> = (listener: (arg: T) => void) => IDisposable;
 
-export interface ISemanticCheckpointAdapter {
-  exportSemanticState(): unknown;
-  importSemanticState(state: unknown): void;
-}
-
 export interface ITerminalAddon {
   activate(terminal: ITerminalCore): void;
   dispose(): void;

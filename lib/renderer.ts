@@ -36,11 +36,8 @@ export interface IRenderable {
 export interface IScrollbackProvider {
   getScrollbackLine(offset: number): GhosttyCell[] | null;
   getScrollbackLength(): number;
+  normalizeViewportBounds?(viewportY?: number): number;
 }
-
-export const SCROLLBAR_BASE_WIDTH = 3;
-export const SCROLLBAR_EXPANDED_WIDTH = 8;
-export const SCROLLBAR_RIGHT_INSET = 3;
 
 // ============================================================================
 // Type Definitions
@@ -116,9 +113,6 @@ export class CanvasRenderer {
 
   // Viewport tracking (for scrolling)
   private lastViewportY: number = 0;
-
-  // Scrollbar hover expansion state
-  private scrollbarHoverProgress = 0;
 
   // Current buffer being rendered (for grapheme lookups)
   private currentBuffer: IRenderable | null = null;
@@ -383,7 +377,9 @@ export class CanvasRenderer {
     const dims = buffer.getDimensions();
     const scrollbackLength = scrollbackProvider ? scrollbackProvider.getScrollbackLength() : 0;
     const requestedViewportY = Number.isFinite(viewportY) ? viewportY : 0;
-    viewportY = Math.max(0, Math.min(scrollbackLength, requestedViewportY));
+    viewportY = scrollbackProvider?.normalizeViewportBounds
+      ? scrollbackProvider.normalizeViewportBounds(requestedViewportY)
+      : Math.max(0, Math.min(scrollbackLength, requestedViewportY));
 
     if (buffer.needsFullRedraw?.()) {
       forceAll = true;
@@ -906,19 +902,6 @@ export class CanvasRenderer {
    * Get current font metrics
    */
 
-  /** Set the smooth hover expansion progress for the scrollbar (0-1). */
-  public setScrollbarHoverProgress(progress: number): void {
-    this.scrollbarHoverProgress = Math.max(0, Math.min(1, progress));
-  }
-
-  /** Get the current visual scrollbar width in CSS pixels. */
-  public getScrollbarWidth(): number {
-    return (
-      SCROLLBAR_BASE_WIDTH +
-      (SCROLLBAR_EXPANDED_WIDTH - SCROLLBAR_BASE_WIDTH) * this.scrollbarHoverProgress
-    );
-  }
-
   /**
    * Render scrollbar (Phase 2)
    * Shows scroll position and allows click/drag interaction
@@ -934,18 +917,16 @@ export class CanvasRenderer {
     const canvasHeight = this.canvas.height / this.devicePixelRatio;
     const canvasWidth = this.canvas.width / this.devicePixelRatio;
 
-    // Keep the right edge fixed while the thumb expands towards the terminal.
-    const scrollbarWidth = this.getScrollbarWidth();
-    const scrollbarX = canvasWidth - scrollbarWidth - SCROLLBAR_RIGHT_INSET;
+    // Scrollbar dimensions
+    const scrollbarWidth = 8;
+    const scrollbarX = canvasWidth - scrollbarWidth - 4;
     const scrollbarPadding = 4;
     const scrollbarTrackHeight = canvasHeight - scrollbarPadding * 2;
 
-    // Clear only the currently painted width. Hover transitions request full redraws,
-    // which restores terminal content under the old width without a black strip.
-    const scrollbarClearX = scrollbarX - 2;
-    ctx.clearRect(scrollbarClearX, 0, scrollbarWidth + 6, canvasHeight);
+    // Always clear the scrollbar area first (fixes ghosting when fading out)
+    ctx.clearRect(scrollbarX - 2, 0, scrollbarWidth + 6, canvasHeight);
     ctx.fillStyle = this.theme.background;
-    ctx.fillRect(scrollbarClearX, 0, scrollbarWidth + 6, canvasHeight);
+    ctx.fillRect(scrollbarX - 2, 0, scrollbarWidth + 6, canvasHeight);
 
     // Don't draw scrollbar if fully transparent or no scrollback
     if (opacity <= 0 || scrollbackLength === 0) return;
