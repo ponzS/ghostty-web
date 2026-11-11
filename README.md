@@ -75,6 +75,11 @@ selection) plus the [WebShell ABI shim](./wasm/webshell_abi.zig), which keeps th
 flat `ghostty_terminal_*` / `ghostty_render_state_*` exports used by this
 library and adds `GHOSTSNP` snapshot encode/restore.
 
+The `ghostty` submodule tracks the [ponzS/ghostty](https://github.com/ponzS/ghostty)
+fork, whose `main` is pinned to an upstream release tag (currently `v1.4.0`), so
+upstream development commits never reach the build. To upgrade, fast-forward the
+fork's `main` to the next upstream release tag, then bump the submodule.
+
 > Requires Zig 0.17+ and Bun.
 
 ```bash
