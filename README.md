@@ -69,10 +69,13 @@ For a comprehensive client <-> server example, refer to the [demo](./demo/index.
 
 ## Development
 
-ghostty-web builds from Ghostty's source with a [patch](./patches/ghostty-wasm-api.patch) to expose additional
-functionality.
+ghostty-web builds Ghostty 1.4's `libghostty-vt` WASM with a small
+[patch](./patches/ghostty-1.4-webshell.patch) (scrollback generation and export
+selection) plus the [WebShell ABI shim](./wasm/webshell_abi.zig), which keeps the
+flat `ghostty_terminal_*` / `ghostty_render_state_*` exports used by this
+library and adds `GHOSTSNP` snapshot encode/restore.
 
-> Requires Zig and Bun.
+> Requires Zig 0.17+ and Bun.
 
 ```bash
 bun run build

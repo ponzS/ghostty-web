@@ -3,62 +3,50 @@ set -euo pipefail
 
 echo "🔨 Building ghostty-vt.wasm..."
 
-# Check for Zig
 if ! command -v zig &> /dev/null; then
     echo "❌ Error: Zig not found"
     echo ""
-    echo "Install Zig 0.15.2+:"
+    echo "Install Zig 0.17.0+ (required by Ghostty 1.4):"
     echo "  macOS:   brew install zig"
     echo "  Linux:   https://ziglang.org/download/"
     echo ""
     exit 1
 fi
 
-ZIG_VERSION=$(zig version)
-echo "✓ Found Zig $ZIG_VERSION"
+echo "✓ Found Zig $(zig version)"
 
-# Initialize/update submodule
-if [ ! -d "ghostty/.git" ]; then
+if [ ! -d "ghostty/.git" ] && [ ! -f "ghostty/.git" ]; then
     echo "📦 Initializing Ghostty submodule..."
     git submodule update --init --recursive
-else
-    echo "📦 Ghostty submodule already initialized"
 fi
 
-# Apply patch
-echo "🔧 Applying WASM API patch..."
+# Absolute paths: the EXIT trap runs after the script has left ghostty/.
+root="$(pwd)"
+patch="$root/patches/ghostty-1.4-webshell.patch"
+abi="$root/ghostty/src/webshell_abi.zig"
+
 cd ghostty
-git apply --check ../patches/ghostty-wasm-api.patch || {
+cleanup() {
+    rm -f "$abi"
+    git -C "$root/ghostty" apply -R "$patch" 2>/dev/null || true
+}
+
+echo "🔧 Applying WebShell ABI patch..."
+git apply --check "$patch" || {
     echo "❌ Patch doesn't apply cleanly"
-    echo "Ghostty may have changed. Check patches/ghostty-wasm-api.patch"
+    echo "Ghostty may have changed. Check patches/ghostty-1.4-webshell.patch"
     exit 1
 }
-git apply ../patches/ghostty-wasm-api.patch
-git apply --check ../patches/ghostty-scrollback-generation.patch || {
-    echo "❌ Scrollback generation patch doesn't apply cleanly"
-    git apply -R ../patches/ghostty-wasm-api.patch
-    rm -f include/ghostty/vt/terminal.h
-    rm -f src/terminal/c/terminal.zig
-    exit 1
-}
-git apply ../patches/ghostty-scrollback-generation.patch
+git apply "$patch"
+trap cleanup EXIT
+cp ../wasm/webshell_abi.zig "$abi"
 
-# Build WASM
-echo "⚙️  Building WASM (takes ~20 seconds)..."
-zig build lib-vt -Dtarget=wasm32-freestanding -Doptimize=ReleaseSmall
+# One generic (non-SIMD) module is shared by the browser, the WebShell server
+# checkpoint engine and the wasm2c native clients.
+echo "⚙️  Building WASM..."
+zig build -Demit-lib-vt -Dtarget=wasm32-freestanding -Dcpu=generic -Doptimize=ReleaseSmall
 
-# Copy to project root
-cd ..
-cp ghostty/zig-out/bin/ghostty-vt.wasm ./
-
-# Revert patch to keep submodule clean
-echo "🧹 Cleaning up..."
-cd ghostty
-git apply -R ../patches/ghostty-scrollback-generation.patch
-git apply -R ../patches/ghostty-wasm-api.patch
-# Remove new files created by the patch
-rm -f include/ghostty/vt/terminal.h
-rm -f src/terminal/c/terminal.zig
+cp zig-out/bin/ghostty-vt.wasm ../ghostty-vt.wasm
 cd ..
 
 SIZE=$(du -h ghostty-vt.wasm | cut -f1)

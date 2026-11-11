@@ -817,19 +817,32 @@ export class GhosttyTerminal {
   readResponse(): string | null {
     if (!this.hasResponse()) return null;
 
-    const bufSize = 256; // Most responses are small
+    // Drain every pending reply at once. Fixed-size reads split one reply
+    // (e.g. a burst of OSC 4 palette reports) across separate PTY writes.
+    const bufSize = 65536;
     const bufPtr = this.exports.ghostty_wasm_alloc_u8_array(bufSize);
+    const parts: Uint8Array[] = [];
+    let total = 0;
 
     try {
-      const bytesRead = this.exports.ghostty_terminal_read_response(this.handle, bufPtr, bufSize);
-
-      if (bytesRead <= 0) return null;
-
-      const bytes = new Uint8Array(this.memory.buffer, bufPtr, bytesRead);
-      return new TextDecoder().decode(bytes.slice());
+      while (this.hasResponse()) {
+        const bytesRead = this.exports.ghostty_terminal_read_response(this.handle, bufPtr, bufSize);
+        if (bytesRead <= 0) break;
+        parts.push(new Uint8Array(this.memory.buffer, bufPtr, bytesRead).slice());
+        total += bytesRead;
+      }
     } finally {
       this.exports.ghostty_wasm_free_u8_array(bufPtr, bufSize);
     }
+
+    if (total === 0) return null;
+    const bytes = new Uint8Array(total);
+    let offset = 0;
+    for (const part of parts) {
+      bytes.set(part, offset);
+      offset += part.length;
+    }
+    return new TextDecoder().decode(bytes);
   }
 
   /**
